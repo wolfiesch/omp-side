@@ -1,13 +1,16 @@
 {
 	"name": "omp-side",
 	"version": "0.1.0",
-	"description": "Fork the current Oh My Pi session into a cmux side pane with /side",
+	"description": "Fork the current Oh My Pi session into a nearby terminal pane or tab with /side",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/wolfiesch/omp-side.git"
 	},
-	"keywords": ["omp", "oh-my-pi", "cmux", "extension", "session-fork"],
+	"scripts": {
+		"test": "bun test"
+	},
+	"keywords": ["omp", "oh-my-pi", "cmux", "tmux", "wezterm", "kitty", "ghostty", "extension", "session-fork"],
 	"files": ["index.ts", "README.md", "LICENSE"],
 	"omp": {
 		"extensions": ["./index.ts"]

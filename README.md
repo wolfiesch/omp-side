@@ -1,9 +1,10 @@
 # omp-side
 
-`/side` for [Oh My Pi](https://github.com/can1357/oh-my-pi) running inside [cmux](https://cmux.com).
+`/side` for [Oh My Pi](https://github.com/can1357/oh-my-pi), with native launch adapters for
+[cmux](https://cmux.com), tmux, WezTerm, Kitty, and Ghostty.
 
-Fork the conversation you are in right now, at this exact point, and drop the fork into a live
-terminal beside you. Ask the tangent there. Your main thread stays clean.
+Fork the conversation you are in right now, at this exact point, and open the fork nearby. Ask the
+tangent there. Your main thread stays clean.
 
 ```
 /side why would that cache miss?
@@ -27,7 +28,12 @@ touch your main conversation unless you ask for it with `--pull`.
 ## Requirements
 
 - `omp` (Oh My Pi) with session persistence on, so not `--no-session`
-- `cmux` on `PATH`, and the omp session running inside a cmux terminal
+- One supported terminal environment:
+  - cmux
+  - tmux
+  - WezTerm with `wezterm cli`
+  - Kitty with remote control available through `kitten @`
+  - Ghostty on macOS or Linux
 - macOS or Linux
 
 ## Install
@@ -51,27 +57,32 @@ Use one method or the other. Both at once registers the command twice.
 ## Usage
 
 ```
-/side <prompt>                          fork, open a split on the right, focus it, ask
-/side                                   fork into an empty side session, focus it
-/side --bg -- <prompt>                  same, but keep focus where it is
-/side --tab -- <prompt>                 fork into its own cmux tab instead of a split
-/side --down -- <prompt>                split below instead of right
-/side --pull -- <prompt>                deliver the fork's first answer back to this session
+/side <prompt>                          auto-place the fork and ask
+/side                                   auto-place an empty side session
+/side --bg -- <prompt>                  open without taking focus
+/side --tab -- <prompt>                 force a new terminal tab
+/side --split -- <prompt>               force another split
+/side --down -- <prompt>                force a split below
+/side --pull -- <prompt>                deliver the fork's first answer back here
 /side --model @slow -- <prompt>         fork into a different model
 ```
 
+Automatic placement keeps layouts bounded: a one-pane terminal gets one split; if that tab or
+workspace is already split, `/side` opens a new tab instead of subdividing it again.
+
 | Flag | Effect |
 |---|---|
-| `--bg` | Do not steal focus. Focus returns to wherever it was. |
-| `--tab` | New cmux workspace instead of a split in this one. |
-| `--left` `--right` `--up` `--down` | Split direction. Default `--right`. |
+| `--bg` | Do not steal focus. |
+| `--tab` | Force a new terminal tab. In tmux this is a new window. |
+| `--split` | Force another split even when the current layout is already split. |
+| `--left` `--right` `--up` `--down` | Force a split in that direction. Default direction is `--right`. |
 | `--pull` | Watch the fork and attach its first answer to your next message here. |
 | anything else | Passed through to `omp`, so `--model`, `--thinking`, `--tools`, and friends all work. |
 
 `--` separates flags from the prompt. Without it the whole argument string is the prompt, unless it
 starts with `-`, in which case it is all flags and the fork opens empty.
 
-`alt+s` is bound to an empty focused fork.
+`alt+s` is bound to an empty focused fork using automatic placement.
 
 ## What `--pull` does
 
@@ -82,17 +93,35 @@ never appears within a minute.
 
 Everything stays local. The watcher reads a file on disk and nothing else.
 
+## Terminal support
+
+| Environment | One-pane default | Already-split default | Explicit controls |
+|---|---|---|---|
+| cmux | New split | New terminal surface tab in the current pane | Exact tab and split direction |
+| tmux | New pane | New tmux window | Exact window and split direction |
+| WezTerm | New pane | New tab | Exact tab and split direction |
+| Kitty | New Kitty window in the current tab | New tab | Tab or split axis; Kitty's active layout decides final ordering |
+| Ghostty directly | New OS window | New OS window | Ghostty does not expose stable cross-platform tab or split control |
+
+cmux embeds Ghostty but is detected first, so an OMP process inside cmux gets cmux panes and tabs.
+Direct Ghostty uses a separate window without keyboard simulation or accessibility scripting.
+Unsupported terminals fail visibly instead of typing a command into an unknown UI.
+
 ## How it works
 
 1. `ctx.sessionManager.getSessionFile()` gives the live session's `.jsonl` path.
-2. `cmux new-split <direction>` creates the pane and returns its surface ref.
-3. `cmux respawn-pane --command` replaces that pane's shell with
-   `exec omp --cwd <cwd> --fork <session.jsonl> [your flags] [your prompt]`.
-4. `omp --fork` copies the transcript into a new session file and records `parentSession` and
+2. The extension detects the innermost supported multiplexer or terminal from its environment.
+3. The adapter counts panes in the current tab or workspace and selects a split or tab.
+4. The adapter starts `omp --cwd <cwd> --fork <session.jsonl> [your flags] [your prompt]`.
+5. `omp --fork` copies the transcript into a new session file and records `parentSession` and
    `providerPromptCacheKey` pointing at the parent.
 
-A spawn is recorded in the parent transcript as a custom entry of type `omp-side.spawn`, so the
-branch point stays visible in the session history and in HTML exports.
+Every argument stays separate for WezTerm, Kitty, and Ghostty. cmux and tmux require one POSIX shell
+command string, so each argument is single-quoted independently before launch.
+
+A spawn is recorded in the parent transcript as a custom entry of type `omp-side.spawn`, including
+the selected terminal, placement, and target. The branch point stays visible in session history and
+HTML exports.
 
 ## Known limits
 
@@ -110,6 +139,10 @@ branch point stays visible in the session history and in HTML exports.
   flush, so a fork taken mid-turn can miss a tool result that has not been written yet.
 - **`alt+s` is unverified.** It is registered, but it could not be exercised through scripted key
   injection, so confirm it by hand.
+- **Kitty remote control is configuration-dependent.** If `kitten @ ls` is denied, enable Kitty
+  remote control using Kitty's documented permission controls. `/side` reports the CLI error.
+- **Direct Ghostty cannot inspect or modify the current tab layout.** Its supported fallback is a
+  new OS window. Use cmux or tmux inside Ghostty for automatic split and tab placement.
 
 ## Uninstall
 

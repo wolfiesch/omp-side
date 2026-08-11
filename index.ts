@@ -1,11 +1,11 @@
 /**
- * omp-side — Codex-desktop-style `/side` for OMP running inside cmux.
+ * omp-side: fork an OMP conversation into a nearby terminal pane or tab.
  *
- *   /side why would the cache miss here?      fork now, ask in a split beside this pane
+ *   /side why would the cache miss here?      auto-place a fork and ask
  *   /side --model @slow -- second opinion?    fork into a different model
- *   /side --bg --pull -- audit the plan       background split; first answer comes back to me
- *   /side --tab -- long tangent               fork into its own cmux tab instead of a split
- *   alt+s                                     empty fork in a side split, focused
+ *   /side --bg --pull -- audit the plan       keep focus; first answer comes back
+ *   /side --tab -- long tangent               force a new terminal tab
+ *   alt+s                                     empty auto-placed fork, focused
  *
  * The fork is a real `omp --fork <session.jsonl>` process: full transcript up to the
  * current point, its own session file, `parentSession` recorded for lineage. Nothing the
@@ -26,13 +26,15 @@ const SPAWN_ENTRY = "omp-side.spawn";
 const POLL_MS = 750;
 const DISCOVER_LIMIT_MS = 60_000;
 const PULL_LIMIT_MS = 30 * 60_000;
-const CMUX_TIMEOUT_MS = 15_000;
+const TERMINAL_TIMEOUT_MS = 15_000;
 
 type Direction = "right" | "left" | "up" | "down";
+type Placement = "auto" | "split" | "tab";
+type TerminalKind = "cmux" | "tmux" | "wezterm" | "kitty" | "ghostty";
 
 interface SideRequest {
 	focus: boolean;
-	tab: boolean;
+	placement: Placement;
 	pull: boolean;
 	direction: Direction;
 	ompArgs: string[];
@@ -50,15 +52,27 @@ function tokenize(input: string): string[] {
 	let current = "";
 	let quote: '"' | "'" | null = null;
 	let quoted = false;
-	for (const ch of input) {
+	for (let index = 0; index < input.length; index++) {
+		const ch = input[index];
 		if (quote) {
-			if (ch === quote) quote = null;
-			else current += ch;
+			if (ch === quote) {
+				quote = null;
+			} else if (quote === '"' && ch === "\\") {
+				if (index + 1 >= input.length) throw new Error("trailing escape in /side flags");
+				current += input[++index];
+			} else {
+				current += ch;
+			}
 			continue;
 		}
 		if (ch === '"' || ch === "'") {
 			quote = ch;
 			quoted = true;
+			continue;
+		}
+		if (ch === "\\") {
+			if (index + 1 >= input.length) throw new Error("trailing escape in /side flags");
+			current += input[++index];
 			continue;
 		}
 		if (/\s/.test(ch)) {
@@ -71,6 +85,7 @@ function tokenize(input: string): string[] {
 		}
 		current += ch;
 	}
+	if (quote) throw new Error("unterminated quote in /side flags");
 	if (current || quoted) out.push(current);
 	return out;
 }
@@ -78,7 +93,7 @@ function tokenize(input: string): string[] {
 function parseRequest(raw: string): SideRequest {
 	const request: SideRequest = {
 		focus: true,
-		tab: false,
+		placement: "auto",
 		pull: false,
 		direction: "right",
 		ompArgs: [],
@@ -109,7 +124,10 @@ function parseRequest(raw: string): SideRequest {
 				request.focus = true;
 				break;
 			case "--tab":
-				request.tab = true;
+				request.placement = "tab";
+				break;
+			case "--split":
+				request.placement = "split";
 				break;
 			case "--pull":
 				request.pull = true;
@@ -119,6 +137,7 @@ function parseRequest(raw: string): SideRequest {
 			case "--up":
 			case "--down":
 				request.direction = token.slice(2) as Direction;
+				request.placement = "split";
 				break;
 			default:
 				request.ompArgs.push(token);
@@ -145,12 +164,357 @@ function resolveOmp(): string {
 	return "omp";
 }
 
-async function cmux(pi: ExtensionAPI, args: string[]): Promise<string> {
-	const result = await pi.exec("cmux", args, { timeout: CMUX_TIMEOUT_MS });
+interface ExecOutput {
+	code: number;
+	stdout: string;
+	stderr: string;
+}
+
+type Runner = (command: string, args: string[]) => Promise<ExecOutput>;
+
+interface LaunchResult {
+	target: string;
+	terminal: TerminalKind;
+	placement: "split" | "tab" | "window";
+}
+
+function createRunner(pi: ExtensionAPI): Runner {
+	return (command, args) => pi.exec(command, args, { timeout: TERMINAL_TIMEOUT_MS });
+}
+
+async function checked(run: Runner, command: string, args: string[]): Promise<string> {
+	const result = await run(command, args);
 	if (result.code !== 0) {
-		throw new Error(`cmux ${args[0]}: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);
+		const detail = (result.stderr || result.stdout).trim() || `exit ${result.code}`;
+		throw new Error(`${command} ${args[0] ?? ""}: ${detail}`.trim());
 	}
 	return result.stdout.trim();
+}
+
+function resolveOnPath(names: string[], path = process.env.PATH ?? ""): string {
+	for (const name of names) {
+		for (const dir of path.split(delimiter)) {
+			if (!dir) continue;
+			const candidate = join(dir, name);
+			try {
+				accessSync(candidate, constants.X_OK);
+				if (statSync(candidate).isFile()) return candidate;
+			} catch {
+				// keep looking
+			}
+		}
+	}
+	return names[0];
+}
+
+function detectTerminal(env: NodeJS.ProcessEnv): TerminalKind | null {
+	if (env.CMUX_WORKSPACE_ID) return "cmux";
+	if (env.TMUX) return "tmux";
+	if (env.WEZTERM_PANE) return "wezterm";
+	if (env.KITTY_WINDOW_ID) return "kitty";
+	if (env.TERM_PROGRAM?.toLowerCase() === "ghostty" || env.GHOSTTY_RESOURCES_DIR) return "ghostty";
+	return null;
+}
+
+function choosePlacement(requested: Placement, paneCount: number): "split" | "tab" {
+	if (requested === "tab") return "tab";
+	if (requested === "split") return "split";
+	return paneCount > 1 ? "tab" : "split";
+}
+
+function cmuxLayout(tree: string, surface: string | undefined): {
+	paneCount: number;
+	ownerPane: string | null;
+} {
+	const panes = new Set<string>();
+	let currentPane: string | null = null;
+	let ownerPane: string | null = null;
+	for (const line of tree.split("\n")) {
+		const pane = /\bpane:\d+\b/.exec(line)?.[0];
+		if (pane) {
+			currentPane = pane;
+			panes.add(pane);
+		}
+		if (surface && line.includes(surface)) ownerPane = currentPane;
+	}
+	return { paneCount: panes.size, ownerPane };
+}
+
+function surfaceRef(output: string): string {
+	const ref = /\bsurface:\d+\b/.exec(output)?.[0];
+	if (!ref) throw new Error(`unexpected cmux output: ${output}`);
+	return ref;
+}
+
+async function launchCmux(
+	run: Runner,
+	env: NodeJS.ProcessEnv,
+	request: SideRequest,
+	cwd: string,
+	argv: string[],
+	title: string,
+): Promise<LaunchResult> {
+	const workspace = env.CMUX_WORKSPACE_ID;
+	if (!workspace) throw new Error("CMUX_WORKSPACE_ID is missing");
+	const sourceSurface = env.CMUX_SURFACE_ID;
+	const tree = await checked(run, "cmux", [
+		"--id-format",
+		"both",
+		"tree",
+		"--workspace",
+		workspace,
+	]);
+	const layout = cmuxLayout(tree, sourceSurface);
+	let identity: {
+		focused?: { pane_ref?: string; window_ref?: string };
+	} | null = null;
+	if (!layout.ownerPane || !request.focus) {
+		identity = JSON.parse(await checked(run, "cmux", ["identify", "--no-caller"]));
+	}
+	const ownerPane = layout.ownerPane ?? identity?.focused?.pane_ref ?? null;
+	const restore =
+		!request.focus && identity?.focused?.pane_ref && identity.focused.window_ref
+			? { pane: identity.focused.pane_ref, window: identity.focused.window_ref }
+			: null;
+	const placement = choosePlacement(request.placement, layout.paneCount);
+	const command = ["exec", ...argv.map(shQuote)].join(" ");
+
+	let target: string;
+	if (placement === "tab") {
+		if (!ownerPane) throw new Error("could not resolve the cmux pane containing this session");
+		target = surfaceRef(
+			await checked(run, "cmux", [
+				"new-surface",
+				"--type",
+				"terminal",
+				"--pane",
+				ownerPane,
+				"--workspace",
+				workspace,
+				"--focus",
+				String(request.focus),
+			]),
+		);
+	} else {
+		target = surfaceRef(
+			await checked(run, "cmux", [
+				"new-split",
+				request.direction,
+				"--workspace",
+				workspace,
+				...(sourceSurface ? ["--surface", sourceSurface] : []),
+				"--focus",
+				String(request.focus),
+			]),
+		);
+	}
+	await checked(run, "cmux", ["rename-tab", "--surface", target, title]);
+	await checked(run, "cmux", ["respawn-pane", "--surface", target, "--command", command]);
+	if (restore) {
+		try {
+			await checked(run, "cmux", [
+				"focus-pane",
+				"--pane",
+				restore.pane,
+				"--window",
+				restore.window,
+			]);
+		} catch {
+			// The source may have closed while the fork was starting.
+		}
+	}
+	return { target, terminal: "cmux", placement };
+}
+
+async function launchTmux(
+	run: Runner,
+	env: NodeJS.ProcessEnv,
+	request: SideRequest,
+	cwd: string,
+	argv: string[],
+	title: string,
+): Promise<LaunchResult> {
+	const sourcePane = env.TMUX_PANE;
+	const countText = await checked(run, "tmux", [
+		"display-message",
+		"-p",
+		...(sourcePane ? ["-t", sourcePane] : []),
+		"#{window_panes}",
+	]);
+	const paneCount = Number.parseInt(countText, 10);
+	if (!Number.isFinite(paneCount)) throw new Error(`unexpected tmux pane count: ${countText}`);
+	const placement = choosePlacement(request.placement, paneCount);
+	const command = argv.map(shQuote).join(" ");
+	const args =
+		placement === "tab"
+			? [
+					"new-window",
+					"-P",
+					"-F",
+					"#{pane_id}",
+					"-c",
+					cwd,
+					"-n",
+					title,
+					...(!request.focus ? ["-d"] : []),
+					command,
+				]
+			: [
+					"split-window",
+					"-P",
+					"-F",
+					"#{pane_id}",
+					"-c",
+					cwd,
+					...(sourcePane ? ["-t", sourcePane] : []),
+					...(request.direction === "left" || request.direction === "right" ? ["-h"] : []),
+					...(request.direction === "left" || request.direction === "up" ? ["-b"] : []),
+					...(!request.focus ? ["-d"] : []),
+					command,
+				];
+	const target = await checked(run, "tmux", args);
+	return { target, terminal: "tmux", placement };
+}
+
+interface WezPane {
+	pane_id: number;
+	tab_id: number;
+}
+
+async function launchWezTerm(
+	run: Runner,
+	env: NodeJS.ProcessEnv,
+	request: SideRequest,
+	cwd: string,
+	argv: string[],
+): Promise<LaunchResult> {
+	const sourcePane = Number.parseInt(env.WEZTERM_PANE ?? "", 10);
+	if (!Number.isFinite(sourcePane)) throw new Error("WEZTERM_PANE is invalid");
+	const panes = JSON.parse(await checked(run, "wezterm", ["cli", "list", "--format", "json"])) as WezPane[];
+	const source = panes.find((pane) => pane.pane_id === sourcePane);
+	if (!source) throw new Error(`WezTerm pane ${sourcePane} was not returned by wezterm cli list`);
+	const paneCount = panes.filter((pane) => pane.tab_id === source.tab_id).length;
+	const placement = choosePlacement(request.placement, paneCount);
+	const args =
+		placement === "tab"
+			? ["cli", "spawn", "--pane-id", String(sourcePane), "--cwd", cwd, "--", ...argv]
+			: [
+					"cli",
+					"split-pane",
+					`--${request.direction}`,
+					"--pane-id",
+					String(sourcePane),
+					"--cwd",
+					cwd,
+					"--",
+					...argv,
+				];
+	const target = await checked(run, "wezterm", args);
+	if (!request.focus) {
+		try {
+			await checked(run, "wezterm", ["cli", "activate-pane", "--pane-id", String(sourcePane)]);
+		} catch {
+			// The source may have closed while the fork was starting.
+		}
+	}
+	return { target, terminal: "wezterm", placement };
+}
+
+interface KittyWindow {
+	id: number;
+}
+
+interface KittyTab {
+	windows?: KittyWindow[];
+}
+
+interface KittyOsWindow {
+	tabs?: KittyTab[];
+}
+
+async function launchKitty(
+	run: Runner,
+	env: NodeJS.ProcessEnv,
+	request: SideRequest,
+	cwd: string,
+	argv: string[],
+	title: string,
+): Promise<LaunchResult> {
+	const sourceWindow = Number.parseInt(env.KITTY_WINDOW_ID ?? "", 10);
+	if (!Number.isFinite(sourceWindow)) throw new Error("KITTY_WINDOW_ID is invalid");
+	const executable = resolveOnPath(["kitten", "kitty"], env.PATH);
+	const osWindows = JSON.parse(await checked(run, executable, ["@", "ls"])) as KittyOsWindow[];
+	const sourceTab = osWindows
+		.flatMap((osWindow) => osWindow.tabs ?? [])
+		.find((tab) => tab.windows?.some((window) => window.id === sourceWindow));
+	if (!sourceTab) throw new Error(`Kitty window ${sourceWindow} was not returned by kitten @ ls`);
+	const placement = choosePlacement(request.placement, sourceTab.windows?.length ?? 1);
+	const args = [
+		"@",
+		"launch",
+		"--match",
+		`id:${sourceWindow}`,
+		"--type",
+		placement === "tab" ? "tab" : "window",
+		"--cwd",
+		cwd,
+		...(placement === "tab" ? ["--tab-title", title] : ["--title", title]),
+		...(!request.focus ? ["--keep-focus"] : []),
+		...(placement === "split"
+			? ["--location", request.direction === "left" || request.direction === "right" ? "vsplit" : "hsplit"]
+			: []),
+		...argv,
+	];
+	const target = await checked(run, executable, args);
+	return { target: target || `kitty:${sourceWindow}`, terminal: "kitty", placement };
+}
+
+async function launchGhostty(
+	run: Runner,
+	platform: NodeJS.Platform,
+	cwd: string,
+	argv: string[],
+): Promise<LaunchResult> {
+	if (platform === "darwin") {
+		await checked(run, "/usr/bin/open", [
+			"-na",
+			"Ghostty.app",
+			"--args",
+			`--working-directory=${cwd}`,
+			"-e",
+			...argv,
+		]);
+	} else {
+		await checked(run, "ghostty", [`--working-directory=${cwd}`, "-e", ...argv]);
+	}
+	return { target: "Ghostty window", terminal: "ghostty", placement: "window" };
+}
+
+async function launchInTerminal(
+	run: Runner,
+	env: NodeJS.ProcessEnv,
+	platform: NodeJS.Platform,
+	request: SideRequest,
+	cwd: string,
+	argv: string[],
+	title: string,
+): Promise<LaunchResult> {
+	switch (detectTerminal(env)) {
+		case "cmux":
+			return launchCmux(run, env, request, cwd, argv, title);
+		case "tmux":
+			return launchTmux(run, env, request, cwd, argv, title);
+		case "wezterm":
+			return launchWezTerm(run, env, request, cwd, argv);
+		case "kitty":
+			return launchKitty(run, env, request, cwd, argv, title);
+		case "ghostty":
+			return launchGhostty(run, platform, cwd, argv);
+		default:
+			throw new Error(
+				"unsupported terminal: use cmux, tmux, WezTerm, Kitty, or Ghostty (direct Ghostty opens a new window)",
+			);
+	}
 }
 
 function paneTitle(prompt: string): string {
@@ -342,87 +706,40 @@ async function openSide(pi: ExtensionAPI, ctx: ExtensionCommandContext, request:
 		ctx.ui.notify("/side has nothing to fork yet — this session has not written any entries.", "error");
 		return;
 	}
-	const workspace = process.env.CMUX_WORKSPACE_ID;
-	if (!workspace) {
-		ctx.ui.notify("/side needs cmux: CMUX_WORKSPACE_ID is not set in this terminal.", "error");
-		return;
-	}
-	const surface = process.env.CMUX_SURFACE_ID;
 	const cwd = ctx.sessionManager.getCwd();
-	// Spawning a pane steals focus, so remember where focus was for `--bg`.
-	let restore: { pane: string; window: string } | null = null;
-	if (!request.focus) {
-		try {
-			const identity = JSON.parse(await cmux(pi, ["identify", "--no-caller"])) as {
-				focused?: { pane_ref?: string; window_ref?: string };
-			};
-			const pane = identity.focused?.pane_ref;
-			const window = identity.focused?.window_ref;
-			if (pane && window) restore = { pane, window };
-		} catch {
-			restore = null;
-		}
-	}
-	const command = [
-		"exec",
-		shQuote(resolveOmp()),
+	const argv = [
+		resolveOmp(),
 		"--cwd",
-		shQuote(cwd),
+		cwd,
 		"--fork",
-		shQuote(sessionFile),
-		...request.ompArgs.map(shQuote),
-		...(request.prompt ? [shQuote(request.prompt)] : []),
-	].join(" ");
-	const title = paneTitle(request.prompt);
-
-	let target: string;
-	if (request.tab) {
-		await cmux(pi, [
-			"new-workspace",
-			"--name",
-			title,
-			"--cwd",
-			cwd,
-			"--command",
-			command,
-			"--focus",
-			String(request.focus),
-		]);
-		target = title;
-	} else {
-		const created = await cmux(pi, [
-			"new-split",
-			request.direction,
-			"--workspace",
-			workspace,
-			...(surface ? ["--surface", surface] : []),
-			"--focus",
-			String(request.focus),
-		]);
-		const ref = /surface:\d+/.exec(created)?.[0];
-		if (!ref) throw new Error(`unexpected cmux new-split output: ${created}`);
-		await cmux(pi, ["rename-tab", "--surface", ref, title]);
-		await cmux(pi, ["respawn-pane", "--surface", ref, "--command", command]);
-		target = ref;
-	}
-	if (restore) {
-		try {
-			await cmux(pi, ["focus-pane", "--pane", restore.pane, "--window", restore.window]);
-		} catch {
-			// best effort: a closed or moved pane just means focus stays where it landed
-		}
-	}
+		sessionFile,
+		...request.ompArgs,
+		...(request.prompt ? [request.prompt] : []),
+	];
+	const launched = await launchInTerminal(
+		createRunner(pi),
+		process.env,
+		process.platform,
+		request,
+		cwd,
+		argv,
+		paneTitle(request.prompt),
+	);
 
 	pi.appendEntry(SPAWN_ENTRY, {
 		parentSessionFile: sessionFile,
-		target,
+		target: launched.target,
+		terminal: launched.terminal,
+		placement: launched.placement,
 		prompt: request.prompt,
 		ompArgs: request.ompArgs,
 		pull: request.pull,
 		at: new Date().toISOString(),
 	});
 	ctx.ui.notify(
-		`side session forked into ${target}${request.pull ? " — its first answer will come back to me" : ""}`,
+		`side session forked into ${launched.terminal} ${launched.placement} ${launched.target}${
+			request.pull ? " — its first answer will come back to me" : ""
+		}`,
 		"info",
 	);
 	if (request.pull) watchFork(pi, ctx, sessionFile);
@@ -430,7 +747,8 @@ async function openSide(pi: ExtensionAPI, ctx: ExtensionCommandContext, request:
 
 export default function ompSide(pi: ExtensionAPI) {
 	pi.registerCommand("side", {
-		description: "Fork this session into a cmux side pane: /side [--bg|--tab|--pull|--model X --] <prompt>",
+		description:
+			"Fork this session beside you: /side [--bg|--split|--tab|--pull|--model X --] <prompt>",
 		handler: async (args, ctx) => {
 			try {
 				await openSide(pi, ctx, parseRequest(args));
@@ -441,12 +759,12 @@ export default function ompSide(pi: ExtensionAPI) {
 	});
 
 	pi.registerShortcut("alt+s", {
-		description: "Fork this session into a cmux side pane",
+		description: "Fork this session beside you",
 		handler: async (ctx) => {
 			try {
 				await openSide(pi, ctx as ExtensionCommandContext, {
 					focus: true,
-					tab: false,
+					placement: "auto",
 					pull: false,
 					direction: "right",
 					ompArgs: [],
@@ -458,3 +776,12 @@ export default function ompSide(pi: ExtensionAPI) {
 		},
 	});
 }
+
+export const __testing = {
+	choosePlacement,
+	cmuxLayout,
+	detectTerminal,
+	launchInTerminal,
+	parseRequest,
+	shQuote,
+};
