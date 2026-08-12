@@ -7,22 +7,30 @@
  *   /side --tab -- long tangent               force a new terminal tab
  *   alt+s                                     empty auto-placed fork, focused
  *
- * The fork is a real `omp --fork <session.jsonl>` process: full transcript up to the
- * current point, its own session file, `parentSession` recorded for lineage. Nothing the
- * side session does can touch this conversation unless you pass `--pull`.
+ * The extension creates a real child session: full transcript up to the current point,
+ * its own session file, and `parentSession` lineage. Parent todos are cleared in the child
+ * before launch so a completion reminder cannot drag the tangent back into the parent's work.
  */
 
 import { accessSync, constants, existsSync, readdirSync, statSync } from "node:fs";
 import { open, readdir, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { basename, delimiter, dirname, join } from "node:path";
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
-} from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 const SPAWN_ENTRY = "omp-side.spawn";
+const SIDE_CONTEXT_ENTRY = "omp-side.context";
+const USER_TODO_EDIT_ENTRY = "user_todo_edit";
+const SIDE_CONTEXT_SWITCH = `<system-notice cause="fork">
+The conversation above belongs to your concurrently running parent session.
+You are a side fork created solely to handle the user's request below.
+
+- Focus exclusively on the user's immediate request.
+- Never continue, update, or complete work from before this notice.
+- The parent owns every earlier todo, plan, and unfinished checklist.
+- The parent may be editing the same working directory. Do not fix or build on its in-flight changes.
+- After answering the side request and completing any todos you created yourself, stop.
+</system-notice>`;
 const POLL_MS = 750;
 const DISCOVER_LIMIT_MS = 60_000;
 const PULL_LIMIT_MS = 30 * 60_000;
@@ -162,6 +170,53 @@ function resolveOmp(): string {
 		}
 	}
 	return "omp";
+}
+
+type SideSessionManager = Pick<
+	ExtensionContext["sessionManager"],
+	"appendCustomEntry" | "appendMessage" | "getSessionFile" | "close"
+>;
+type ForkFactory = (sourcePath: string, cwd: string, sessionDir?: string) => Promise<SideSessionManager>;
+
+function seedTangentContext(
+	manager: Pick<SideSessionManager, "appendCustomEntry" | "appendMessage">,
+	parentSessionFile: string,
+): void {
+	manager.appendCustomEntry(SIDE_CONTEXT_ENTRY, { parentSessionFile });
+	manager.appendCustomEntry(USER_TODO_EDIT_ENTRY, { phases: [] });
+	manager.appendMessage({
+		role: "developer",
+		content: [{ type: "text", text: SIDE_CONTEXT_SWITCH }],
+		attribution: "agent",
+		timestamp: Date.now(),
+	});
+}
+
+async function prepareSideFork(
+	parentSessionFile: string,
+	cwd: string,
+	forkFrom: ForkFactory,
+	sessionDir?: string,
+): Promise<string> {
+	const manager = await forkFrom(parentSessionFile, cwd, sessionDir);
+	try {
+		seedTangentContext(manager, parentSessionFile);
+		const childSessionFile = manager.getSessionFile();
+		if (!childSessionFile) throw new Error("OMP created a side fork without a session file");
+		return childSessionFile;
+	} finally {
+		await manager.close();
+	}
+}
+
+function isSideFork(ctx: ExtensionContext): boolean {
+	return ctx.sessionManager
+		.getBranch()
+		.some(
+			(entry) =>
+				entry.type === "custom" &&
+				entry.customType === SIDE_CONTEXT_ENTRY,
+		);
 }
 
 interface ExecOutput {
@@ -700,19 +755,28 @@ async function openSide(pi: ExtensionAPI, ctx: ExtensionCommandContext, request:
 		ctx.ui.notify("/side needs a persisted session (this one runs with --no-session).", "error");
 		return;
 	}
-	// A session with no durable entries yet has a path but no file; `omp --fork` would
-	// silently degrade to a plain new session, so say so instead of pretending.
+	// A session with no durable entries yet has a path but no file; the fork factory would
+	// otherwise fail after the terminal placement has already started.
 	if (!existsSync(sessionFile)) {
 		ctx.ui.notify("/side has nothing to fork yet — this session has not written any entries.", "error");
 		return;
 	}
 	const cwd = ctx.sessionManager.getCwd();
+	const managerClass = ctx.sessionManager.constructor as unknown as { forkFrom?: ForkFactory };
+	if (typeof managerClass.forkFrom !== "function") {
+		throw new Error("this OMP build does not expose session forking to extensions");
+	}
+	const childSessionFile = await prepareSideFork(
+		sessionFile,
+		cwd,
+		(sourcePath, childCwd, sessionDir) => managerClass.forkFrom!(sourcePath, childCwd, sessionDir),
+	);
 	const argv = [
 		resolveOmp(),
 		"--cwd",
 		cwd,
-		"--fork",
-		sessionFile,
+		"--resume",
+		childSessionFile,
 		...request.ompArgs,
 		...(request.prompt ? [request.prompt] : []),
 	];
@@ -745,7 +809,23 @@ async function openSide(pi: ExtensionAPI, ctx: ExtensionCommandContext, request:
 	if (request.pull) watchFork(pi, ctx, sessionFile);
 }
 
+function reinjectSideContext(pi: ExtensionAPI, ctx: ExtensionContext): void {
+	if (!isSideFork(ctx)) return;
+	pi.sendMessage(
+		{
+			customType: "omp-side.context-switch",
+			content: SIDE_CONTEXT_SWITCH,
+			display: false,
+			attribution: "agent",
+		},
+		{ deliverAs: "nextTurn" },
+	);
+}
+
 export default function ompSide(pi: ExtensionAPI) {
+	pi.on("auto_compaction_end", async (event, ctx) => {
+		if (event.result && !event.aborted) reinjectSideContext(pi, ctx);
+	});
 	pi.registerCommand("side", {
 		description:
 			"Fork this session beside you: /side [--bg|--split|--tab|--pull|--model X --] <prompt>",
@@ -778,6 +858,12 @@ export default function ompSide(pi: ExtensionAPI) {
 }
 
 export const __testing = {
+	prepareSideFork,
+	seedTangentContext,
+	isSideFork,
+	SIDE_CONTEXT_ENTRY,
+	USER_TODO_EDIT_ENTRY,
+	SIDE_CONTEXT_SWITCH,
 	choosePlacement,
 	cmuxLayout,
 	detectTerminal,

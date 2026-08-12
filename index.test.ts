@@ -52,6 +52,77 @@ describe("request parsing", () => {
 	});
 });
 
+describe("tangent isolation", () => {
+	test("persists an empty todo snapshot and fork boundary before launch", async () => {
+		const customEntries: Array<{ customType: string; data: unknown }> = [];
+		const messages: unknown[] = [];
+		const forkCalls: unknown[][] = [];
+		let closed = false;
+		const childFile = await __testing.prepareSideFork(
+			"/sessions/parent.jsonl",
+			"/work",
+			async (...args) => {
+				forkCalls.push(args);
+				return {
+					appendCustomEntry(customType: string, data?: unknown) {
+						customEntries.push({ customType, data });
+						return "entry";
+					},
+					appendMessage(message: unknown) {
+						messages.push(message);
+						return "message";
+					},
+					getSessionFile() {
+						return "/sessions/child.jsonl";
+					},
+					async close() {
+						closed = true;
+					},
+				} as never;
+			},
+		);
+
+		expect(childFile).toBe("/sessions/child.jsonl");
+		expect(forkCalls).toEqual([["/sessions/parent.jsonl", "/work", undefined]]);
+		expect(customEntries).toEqual([
+			{
+				customType: __testing.SIDE_CONTEXT_ENTRY,
+				data: { parentSessionFile: "/sessions/parent.jsonl" },
+			},
+			{ customType: __testing.USER_TODO_EDIT_ENTRY, data: { phases: [] } },
+		]);
+		expect(messages).toEqual([
+			expect.objectContaining({
+				role: "developer",
+				content: [
+					expect.objectContaining({
+						type: "text",
+						text: expect.stringContaining("parent owns every earlier todo"),
+					}),
+				],
+			}),
+		]);
+		expect(closed).toBe(true);
+	});
+
+	test("recognizes only child context markers", () => {
+		expect(
+			__testing.isSideFork({
+				sessionManager: {
+					getBranch: () => [{ type: "custom", customType: __testing.SIDE_CONTEXT_ENTRY }],
+				},
+			} as Parameters<typeof __testing.isSideFork>[0]),
+		).toBe(true);
+		expect(
+			__testing.isSideFork({
+				sessionManager: {
+					getBranch: () => [{ type: "custom", customType: "omp-side.spawn" }],
+				},
+			} as Parameters<typeof __testing.isSideFork>[0]),
+		).toBe(false);
+	});
+});
+
 describe("terminal detection", () => {
 	test("prefers an inner multiplexer over its host emulator", () => {
 		expect(__testing.detectTerminal({ TMUX: "/tmp/tmux", KITTY_WINDOW_ID: "4" })).toBe("tmux");

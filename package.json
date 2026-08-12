@@ -1,6 +1,6 @@
 {
 	"name": "omp-side",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Fork the current Oh My Pi session into a nearby terminal pane or tab with /side",
 	"license": "MIT",
 	"repository": {

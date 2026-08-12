@@ -21,9 +21,10 @@ tangent there. Your main thread stays clean.
 └────────────────────────────┴────────────────────────────┘
 ```
 
-The fork is a real `omp` process started with `omp --fork <session.jsonl>`. It gets the whole
-transcript, its own session file, and `parentSession` recorded for lineage. Nothing it does can
-touch your main conversation unless you ask for it with `--pull`.
+The extension creates a real child `omp` session before opening it nearby. The child gets the whole
+transcript, its own session file, and `parentSession` lineage, but not the parent's active todo list.
+A fork-boundary instruction keeps earlier work assigned to the concurrently running parent. Nothing
+the child does can affect the main conversation unless you ask for its first answer with `--pull`.
 
 ## Requirements
 
@@ -112,9 +113,10 @@ Unsupported terminals fail visibly instead of typing a command into an unknown U
 1. `ctx.sessionManager.getSessionFile()` gives the live session's `.jsonl` path.
 2. The extension detects the innermost supported multiplexer or terminal from its environment.
 3. The adapter counts panes in the current tab or workspace and selects a split or tab.
-4. The adapter starts `omp --cwd <cwd> --fork <session.jsonl> [your flags] [your prompt]`.
-5. `omp --fork` copies the transcript into a new session file and records `parentSession` and
+4. The extension forks the transcript into a new session file, recording `parentSession` and
    `providerPromptCacheKey` pointing at the parent.
+5. It appends an empty todo snapshot and a hidden tangent boundary to the child.
+6. The adapter starts `omp --cwd <cwd> --resume <child-session.jsonl> [your flags] [your prompt]`.
 
 Every argument stays separate for WezTerm, Kitty, and Ghostty. cmux and tmux require one POSIX shell
 command string, so each argument is single-quoted independently before launch.
@@ -122,6 +124,9 @@ command string, so each argument is single-quoted independently before launch.
 A spawn is recorded in the parent transcript as a custom entry of type `omp-side.spawn`, including
 the selected terminal, placement, and target. The branch point stays visible in session history and
 HTML exports.
+
+The boundary is re-injected after child-session compaction. Parent todos therefore remain context,
+not child obligations, and an incomplete-todo reminder cannot resume the parent's work.
 
 ## Known limits
 
