@@ -49,6 +49,129 @@ interface SideRequest {
 	prompt: string;
 }
 
+interface CompletionItem {
+	value: string;
+	label: string;
+	description?: string;
+}
+
+interface CompletionModel {
+	selector: string;
+	label: string;
+	description: string;
+}
+
+const SIDE_FLAG_COMPLETIONS: readonly CompletionItem[] = [
+	{ value: "--bg", label: "--bg", description: "Open without taking focus" },
+	{ value: "--focus", label: "--focus", description: "Focus the new side session" },
+	{ value: "--tab", label: "--tab", description: "Open in a new terminal tab" },
+	{ value: "--split", label: "--split", description: "Force a terminal split" },
+	{ value: "--left", label: "--left", description: "Split to the left" },
+	{ value: "--right", label: "--right", description: "Split to the right" },
+	{ value: "--up", label: "--up", description: "Split above" },
+	{ value: "--down", label: "--down", description: "Split below" },
+	{ value: "--pull", label: "--pull", description: "Attach the first answer to the parent session" },
+	{ value: "--model", label: "--model", description: "Choose the side session model" },
+	{ value: "--thinking", label: "--thinking", description: "Choose the reasoning level" },
+	{ value: "--", label: "--", description: "Finish options and start the prompt" },
+];
+
+const THINKING_LEVEL_COMPLETIONS: readonly CompletionItem[] = [
+	{ value: "off", label: "off", description: "Disable reasoning" },
+	{ value: "minimal", label: "minimal", description: "Minimal reasoning" },
+	{ value: "low", label: "low", description: "Low reasoning" },
+	{ value: "medium", label: "medium", description: "Medium reasoning" },
+	{ value: "high", label: "high", description: "High reasoning" },
+	{ value: "xhigh", label: "xhigh", description: "Extra-high reasoning" },
+	{ value: "max", label: "max", description: "Maximum reasoning" },
+	{ value: "auto", label: "auto", description: "Let OMP choose for the model" },
+];
+
+function completeValues(
+	head: string,
+	query: string,
+	items: readonly CompletionItem[],
+): CompletionItem[] | null {
+	const normalized = query.toLowerCase();
+	const matches = items
+		.filter(item => item.value.toLowerCase().startsWith(normalized))
+		.map(item => ({ ...item, value: `${head}${item.value} ` }));
+	return matches.length > 0 ? matches : null;
+}
+
+function getSideArgumentCompletions(
+	argumentPrefix: string,
+	models: readonly CompletionModel[],
+): CompletionItem[] | null {
+	const separator = argumentPrefix.search(/(^|\s)--(\s|$)/);
+	if (separator !== -1) return null;
+
+	const tokenMatch = argumentPrefix.match(/^(.*\s)?(\S*)$/);
+	if (!tokenMatch) return null;
+	const head = tokenMatch[1] ?? "";
+	const query = tokenMatch[2] ?? "";
+	const priorTokens = head.trim().split(/\s+/).filter(Boolean);
+	const previous = priorTokens.at(-1);
+
+	if (previous === "--model") {
+		const normalized = query.toLowerCase();
+		const matches = models
+			.filter(model => {
+				const selector = model.selector.toLowerCase();
+				const bareId = selector.slice(selector.indexOf("/") + 1);
+				return (
+					selector.includes(normalized) ||
+					bareId.startsWith(normalized) ||
+					model.description.toLowerCase().includes(normalized)
+				);
+			})
+			.map(model => ({
+				value: `${head}${model.selector} `,
+				label: model.label,
+				description: model.description,
+			}));
+		return matches.length > 0 ? matches : null;
+	}
+
+	if (previous === "--thinking") {
+		return completeValues(head, query, THINKING_LEVEL_COMPLETIONS);
+	}
+
+	if (query && !query.startsWith("-")) return null;
+	const used = new Set(priorTokens);
+	return completeValues(
+		head,
+		query,
+		SIDE_FLAG_COMPLETIONS.filter(item => item.value === "--" || !used.has(item.value)),
+	);
+}
+
+function buildCompletionModels(ctx: Pick<ExtensionContext, "models">): CompletionModel[] {
+	const current = ctx.models.current();
+	const models = ctx.models
+		.list()
+		.map(model => {
+			const selector = `${model.provider}/${model.id}`;
+			const details = [model.name];
+			if (current?.provider === model.provider && current.id === model.id) details.push("current");
+			if (model.thinking?.efforts.length) details.push(model.thinking.efforts.join(", "));
+			return { selector, label: selector, description: details.join(" · ") };
+		})
+		.sort((left, right) => left.selector.localeCompare(right.selector));
+
+	const roles: CompletionModel[] = [];
+	for (const selector of ["@smol", "@slow"]) {
+		const model = ctx.models.resolve(selector);
+		if (!model) continue;
+		roles.push({
+			selector,
+			label: selector,
+			description: `Role → ${model.provider}/${model.id}`,
+		});
+	}
+	return [...roles, ...models];
+}
+
 /** POSIX single-quote escaping; the pane runs the string under `/bin/sh -c`. */
 function shQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
@@ -823,12 +946,16 @@ function reinjectSideContext(pi: ExtensionAPI, ctx: ExtensionContext): void {
 }
 
 export default function ompSide(pi: ExtensionAPI) {
+	let completionModels: CompletionModel[] = [];
+	pi.on("session_start", (_event, ctx) => {
+		completionModels = buildCompletionModels(ctx);
+	});
 	pi.on("auto_compaction_end", async (event, ctx) => {
 		if (event.result && !event.aborted) reinjectSideContext(pi, ctx);
 	});
 	pi.registerCommand("side", {
-		description:
-			"Fork this session beside you: /side [--bg|--split|--tab|--pull|--model X --] <prompt>",
+		description: "Fork this session beside you: /side [--model X --thinking LEVEL --] <prompt>",
+		getArgumentCompletions: argumentPrefix => getSideArgumentCompletions(argumentPrefix, completionModels),
 		handler: async (args, ctx) => {
 			try {
 				await openSide(pi, ctx, parseRequest(args));
@@ -869,5 +996,7 @@ export const __testing = {
 	detectTerminal,
 	launchInTerminal,
 	parseRequest,
+	buildCompletionModels,
+	getSideArgumentCompletions,
 	shQuote,
 };

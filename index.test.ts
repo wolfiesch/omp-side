@@ -52,6 +52,63 @@ describe("request parsing", () => {
 	});
 });
 
+describe("argument completion", () => {
+	const models = [
+		{
+			selector: "@smol",
+			label: "@smol",
+			description: "anthropic/claude-haiku-4-5 · Fast, cheap role",
+		},
+		{
+			selector: "anthropic/claude-opus-4-6",
+			label: "anthropic/claude-opus-4-6",
+			description: "Claude Opus 4.6 · minimal, low, medium, high, max",
+		},
+		{
+			selector: "openai/gpt-5.4",
+			label: "openai/gpt-5.4",
+			description: "GPT-5.4 · low, medium, high, xhigh",
+		},
+	];
+
+	test("completes side flags from the current token", () => {
+		expect(__testing.getSideArgumentCompletions("--m", models)).toEqual([
+			{
+				value: "--model ",
+				label: "--model",
+				description: "Choose the side session model",
+			},
+		]);
+	});
+
+	test("completes models while preserving earlier options", () => {
+		expect(__testing.getSideArgumentCompletions("--bg --model opus", models)).toEqual([
+			{
+				value: "--bg --model anthropic/claude-opus-4-6 ",
+				label: "anthropic/claude-opus-4-6",
+				description: "Claude Opus 4.6 · minimal, low, medium, high, max",
+			},
+		]);
+		expect(__testing.getSideArgumentCompletions("--model @s", models)?.[0]?.value).toBe("--model @smol ");
+	});
+
+	test("completes reasoning levels and then returns to flags", () => {
+		expect(__testing.getSideArgumentCompletions("--thinking h", models)).toEqual([
+			{ value: "--thinking high ", label: "high", description: "High reasoning" },
+		]);
+		expect(
+			__testing
+				.getSideArgumentCompletions("--thinking high --p", models)
+				?.map(item => item.value),
+		).toEqual(["--thinking high --pull "]);
+	});
+
+	test("does not suggest options inside the prompt", () => {
+		expect(__testing.getSideArgumentCompletions("--model @smol -- explain this", models)).toBeNull();
+		expect(__testing.getSideArgumentCompletions("explain", models)).toBeNull();
+	});
+});
+
 describe("tangent isolation", () => {
 	test("persists an empty todo snapshot and fork boundary before launch", async () => {
 		const customEntries: Array<{ customType: string; data: unknown }> = [];
@@ -236,10 +293,10 @@ describe("terminal launch adapters", () => {
 		const fake = runner((_command, args) =>
 			args[1] === "ls"
 				? {
-						stdout: JSON.stringify([
-							{ tabs: [{ windows: [{ id: 11 }, { id: 12 }] }] },
-						]),
-					}
+					stdout: JSON.stringify([
+						{ tabs: [{ windows: [{ id: 11 }, { id: 12 }] }] },
+					]),
+				}
 				: { stdout: "13" },
 		);
 		const result = await __testing.launchInTerminal(

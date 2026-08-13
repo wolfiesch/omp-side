@@ -65,7 +65,8 @@ Use one method or the other. Both at once registers the command twice.
 /side --split -- <prompt>               force another split
 /side --down -- <prompt>                force a split below
 /side --pull -- <prompt>                deliver the fork's first answer back here
-/side --model @slow -- <prompt>         fork into a different model
+/side --model @slow --thinking high -- <prompt>
+                                         fork with a different model and reasoning level
 ```
 
 Automatic placement keeps layouts bounded: a one-pane terminal gets one split; if that tab or
@@ -84,6 +85,11 @@ workspace is already split, `/side` opens a new tab instead of subdividing it ag
 starts with `-`, in which case it is all flags and the fork opens empty.
 
 `alt+s` is bound to an empty focused fork using automatic placement.
+
+Typing `/side ` opens argument completion. Continue with `--m` to choose from authenticated models or
+role aliases such as `@smol` and `@slow`; `--thinking` offers the supported CLI reasoning levels.
+Choose `--` when you are ready to type the prompt. Earlier options remain intact as each completion
+is accepted, so the whole launch can be built without memorizing flag values.
 
 ## What `--pull` does
 
