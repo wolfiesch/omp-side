@@ -313,11 +313,11 @@ describe("terminal launch adapters", () => {
 		expect(fake.calls[1].args.slice(-argv.length)).toEqual(argv);
 	});
 
-	test("direct Ghostty uses a new OS window without shell interpolation", async () => {
+	test("direct Ghostty preserves PATH without shell interpolation", async () => {
 		const fake = runner(() => ({}));
 		const result = await __testing.launchInTerminal(
 			fake.run,
-			{ TERM_PROGRAM: "ghostty" },
+			{ TERM_PROGRAM: "ghostty", PATH: "/Users/a path/'quote'/$HOME:/opt/homebrew/bin:/usr/bin" },
 			"darwin",
 			baseRequest,
 			"/tmp/a b",
@@ -328,7 +328,38 @@ describe("terminal launch adapters", () => {
 		expect(result.placement).toBe("window");
 		expect(fake.calls[0]).toEqual({
 			command: "/usr/bin/open",
-			args: ["-na", "Ghostty.app", "--args", "--working-directory=/tmp/a b", "-e", ...argv],
+			args: [
+				"-na",
+				"Ghostty.app",
+				"--args",
+				"--working-directory=/tmp/a b",
+				"-e",
+				"/usr/bin/env",
+				"PATH=/Users/a path/'quote'/$HOME:/opt/homebrew/bin:/usr/bin",
+				...argv,
+			],
 		});
+	});
+
+	test("direct Ghostty leaves its default environment when PATH is absent", async () => {
+		const fake = runner(() => ({}));
+		await __testing.launchInTerminal(
+			fake.run,
+			{ TERM_PROGRAM: "ghostty" },
+			"darwin",
+			baseRequest,
+			"/tmp/a b",
+			argv,
+			"side title",
+		);
+
+		expect(fake.calls[0].args).toEqual([
+			"-na",
+			"Ghostty.app",
+			"--args",
+			"--working-directory=/tmp/a b",
+			"-e",
+			...argv,
+		]);
 	});
 });
