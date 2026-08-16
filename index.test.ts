@@ -195,6 +195,19 @@ describe("terminal detection", () => {
 	});
 });
 
+describe("child command PATH", () => {
+	test("prepends the active runtime directory once", () => {
+		expect(__testing.pathWithExecutableDir("/usr/bin:/bin", "/opt/runtime/bin/bun")).toBe(
+			"/opt/runtime/bin:/usr/bin:/bin",
+		);
+		expect(__testing.pathWithExecutableDir("/opt/runtime/bin:/usr/bin", "/opt/runtime/bin/bun")).toBe(
+			"/opt/runtime/bin:/usr/bin",
+		);
+		expect(__testing.pathWithExecutableDir("", "/opt/runtime/bin/bun")).toBe("/opt/runtime/bin");
+		expect(__testing.pathWithExecutableDir(undefined, "/opt/runtime/bin/bun")).toBeUndefined();
+	});
+});
+
 describe("automatic placement", () => {
 	test("uses a tab once the current layout already has a split", () => {
 		expect(__testing.choosePlacement("auto", 2)).toBe("tab");
@@ -314,10 +327,12 @@ describe("terminal launch adapters", () => {
 	});
 
 	test("direct Ghostty preserves PATH without shell interpolation", async () => {
+		const parentPath = "/Users/a path/'quote'/$HOME:/usr/bin";
+		const expectedPath = __testing.pathWithExecutableDir(parentPath, process.execPath);
 		const fake = runner(() => ({}));
 		const result = await __testing.launchInTerminal(
 			fake.run,
-			{ TERM_PROGRAM: "ghostty", PATH: "/Users/a path/'quote'/$HOME:/opt/homebrew/bin:/usr/bin" },
+			{ TERM_PROGRAM: "ghostty", PATH: parentPath },
 			"darwin",
 			baseRequest,
 			"/tmp/a b",
@@ -335,7 +350,7 @@ describe("terminal launch adapters", () => {
 				"--working-directory=/tmp/a b",
 				"-e",
 				"/usr/bin/env",
-				"PATH=/Users/a path/'quote'/$HOME:/opt/homebrew/bin:/usr/bin",
+				`PATH=${expectedPath}`,
 				...argv,
 			],
 		});

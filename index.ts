@@ -385,6 +385,13 @@ function resolveOnPath(names: string[], path = process.env.PATH ?? ""): string {
 	return names[0];
 }
 
+function pathWithExecutableDir(path: string | undefined, executable: string): string | undefined {
+	if (path === undefined) return undefined;
+	const executableDir = dirname(executable);
+	if (path.split(delimiter).includes(executableDir)) return path;
+	return path ? `${executableDir}${delimiter}${path}` : executableDir;
+}
+
 function detectTerminal(env: NodeJS.ProcessEnv): TerminalKind | null {
 	if (env.CMUX_WORKSPACE_ID) return "cmux";
 	if (env.TMUX) return "tmux";
@@ -655,10 +662,11 @@ async function launchGhostty(
 	argv: string[],
 ): Promise<LaunchResult> {
 	if (platform === "darwin") {
-		// LaunchServices does not preserve the invoking shell's PATH for a fresh app
-		// instance. Set it on the child command instead of relying on shell profiles or
-		// changing the environment of the entire Ghostty app process.
-		const command = env.PATH === undefined ? argv : ["/usr/bin/env", `PATH=${env.PATH}`, ...argv];
+		// LaunchServices does not preserve the invoking shell's PATH for a fresh app.
+		// Include the active runtime directory as well: OMP can itself be launched by an
+		// absolute path even when Bun, Node, or another script runtime is absent from PATH.
+		const childPath = pathWithExecutableDir(env.PATH, process.execPath);
+		const command = childPath === undefined ? argv : ["/usr/bin/env", `PATH=${childPath}`, ...argv];
 		await checked(run, "/usr/bin/open", [
 			"-na",
 			"Ghostty.app",
@@ -998,6 +1006,7 @@ export const __testing = {
 	SIDE_CONTEXT_SWITCH,
 	choosePlacement,
 	cmuxLayout,
+	pathWithExecutableDir,
 	detectTerminal,
 	launchInTerminal,
 	parseRequest,
