@@ -392,6 +392,12 @@ function pathWithExecutableDir(path: string | undefined, executable: string): st
 	return path ? `${executableDir}${delimiter}${path}` : executableDir;
 }
 
+function commandWithRuntimePath(argv: string[], path: string | undefined, executable: string): string[] {
+	const childPath = pathWithExecutableDir(path, executable);
+	if (childPath === undefined) return argv;
+	return ["/usr/bin/env", `PATH=${childPath}`, ...argv];
+}
+
 function detectTerminal(env: NodeJS.ProcessEnv): TerminalKind | null {
 	if (env.CMUX_WORKSPACE_ID) return "cmux";
 	if (env.TMUX) return "tmux";
@@ -656,24 +662,18 @@ async function launchKitty(
 
 async function launchGhostty(
 	run: Runner,
-	env: NodeJS.ProcessEnv,
 	platform: NodeJS.Platform,
 	cwd: string,
 	argv: string[],
 ): Promise<LaunchResult> {
 	if (platform === "darwin") {
-		// LaunchServices does not preserve the invoking shell's PATH for a fresh app.
-		// Include the active runtime directory as well: OMP can itself be launched by an
-		// absolute path even when Bun, Node, or another script runtime is absent from PATH.
-		const childPath = pathWithExecutableDir(env.PATH, process.execPath);
-		const command = childPath === undefined ? argv : ["/usr/bin/env", `PATH=${childPath}`, ...argv];
 		await checked(run, "/usr/bin/open", [
 			"-na",
 			"Ghostty.app",
 			"--args",
 			`--working-directory=${cwd}`,
 			"-e",
-			...command,
+			...argv,
 		]);
 	} else {
 		await checked(run, "ghostty", [`--working-directory=${cwd}`, "-e", ...argv]);
@@ -690,17 +690,18 @@ async function launchInTerminal(
 	argv: string[],
 	title: string,
 ): Promise<LaunchResult> {
+	const command = commandWithRuntimePath(argv, env.PATH, process.execPath);
 	switch (detectTerminal(env)) {
 		case "cmux":
-			return launchCmux(run, env, request, cwd, argv, title);
+			return launchCmux(run, env, request, cwd, command, title);
 		case "tmux":
-			return launchTmux(run, env, request, cwd, argv, title);
+			return launchTmux(run, env, request, cwd, command, title);
 		case "wezterm":
-			return launchWezTerm(run, env, request, cwd, argv);
+			return launchWezTerm(run, env, request, cwd, command);
 		case "kitty":
-			return launchKitty(run, env, request, cwd, argv, title);
+			return launchKitty(run, env, request, cwd, command, title);
 		case "ghostty":
-			return launchGhostty(run, env, platform, cwd, argv);
+			return launchGhostty(run, platform, cwd, command);
 		default:
 			throw new Error(
 				"unsupported terminal: use cmux, tmux, WezTerm, Kitty, or Ghostty (direct Ghostty opens a new window)",
@@ -1007,6 +1008,7 @@ export const __testing = {
 	choosePlacement,
 	cmuxLayout,
 	pathWithExecutableDir,
+	commandWithRuntimePath,
 	detectTerminal,
 	launchInTerminal,
 	parseRequest,

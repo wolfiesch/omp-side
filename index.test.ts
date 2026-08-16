@@ -227,6 +227,8 @@ describe("automatic placement", () => {
 
 describe("terminal launch adapters", () => {
 	test("cmux adds a terminal tab instead of a third split", async () => {
+		const parentPath = "/Users/test/.local/bin:/usr/bin:/bin";
+		const expectedPath = __testing.pathWithExecutableDir(parentPath, process.execPath);
 		const fake = runner((_command, args) => {
 			if (args.includes("tree")) {
 				return {
@@ -239,7 +241,7 @@ describe("terminal launch adapters", () => {
 		});
 		const result = await __testing.launchInTerminal(
 			fake.run,
-			{ CMUX_WORKSPACE_ID: "workspace-uuid-2", CMUX_SURFACE_ID: "uuid-surface-8" },
+			{ CMUX_WORKSPACE_ID: "workspace-uuid-2", CMUX_SURFACE_ID: "uuid-surface-8", PATH: parentPath },
 			"darwin",
 			baseRequest,
 			"/tmp/a b",
@@ -251,6 +253,8 @@ describe("terminal launch adapters", () => {
 		expect(fake.calls.some((call) => call.args[0] === "new-split")).toBe(false);
 		expect(fake.calls.find((call) => call.args[0] === "new-surface")?.args).toContain("pane:4");
 		const command = fake.calls.find((call) => call.args[0] === "respawn-pane")?.args.at(-1);
+		expect(command).toContain("'/usr/bin/env'");
+		expect(command).toContain(`'PATH=${expectedPath}'`);
 		expect(command).toContain("'a path/'\\''quote'\\''/$HOME; still one argument'");
 	});
 
