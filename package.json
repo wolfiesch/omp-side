@@ -10,7 +10,20 @@
 	"scripts": {
 		"test": "bun test"
 	},
-	"keywords": ["omp", "oh-my-pi", "cmux", "tmux", "wezterm", "kitty", "ghostty", "extension", "session-fork"],
+	"keywords": [
+		"oh-my-pi",
+		"omp",
+		"coding-agent",
+		"cmux",
+		"tmux",
+		"wezterm",
+		"kitty",
+		"ghostty",
+		"extension",
+		"session-fork",
+		"subagent",
+		"terminal-multiplexer"
+	],
 	"files": ["index.ts", "README.md", "LICENSE"],
 	"omp": {
 		"extensions": ["./index.ts"]

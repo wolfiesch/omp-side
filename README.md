@@ -1,10 +1,8 @@
 # omp-side
 
-`/side` for [Oh My Pi](https://github.com/can1357/oh-my-pi), with native launch adapters for
-[cmux](https://cmux.com), tmux, WezTerm, Kitty, and Ghostty.
+`/side` for [Oh My Pi](https://github.com/can1357/oh-my-pi), with native launch adapters for [cmux](https://cmux.com), tmux, WezTerm, Kitty, and Ghostty.
 
-Fork the conversation you are in right now, at this exact point, and open the fork nearby. Ask the
-tangent there. Your main thread stays clean.
+Fork the conversation you are in right now, at this exact point, and open the fork nearby. Ask the tangent there. Your main thread stays clean.
 
 ```
 /side why would that cache miss?
@@ -43,8 +41,7 @@ the child does can affect the main conversation unless you ask for its first ans
 omp plugin install github:wolfiesch/omp-side
 ```
 
-Restart omp. Extensions load at startup, so the session you are in when you install will not have
-`/side` yet.
+Restart omp. Extensions load at startup, so the session you are in when you install will not have `/side` yet.
 
 Prefer a plain file? Clone anywhere and symlink the single module instead:
 
@@ -54,7 +51,6 @@ ln -s "$PWD/omp-side/index.ts" ~/.omp/agent/extensions/omp-side.ts
 ```
 
 Use one method or the other. Both at once registers the command twice.
-
 ## Usage
 
 ```
