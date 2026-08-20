@@ -263,6 +263,45 @@ describe("terminal launch adapters", () => {
 		expect(command).toContain("'a path/'\\''quote'\\''/$HOME; still one argument'");
 	});
 
+	test("cmux starts the child without waiting for the tab rename", async () => {
+		const renameGate = Promise.withResolvers<void>();
+		const renameStarted = Promise.withResolvers<void>();
+		let respawnStarted = false;
+		const run = async (_command: string, args: string[]) => {
+			if (args.includes("tree")) {
+				return {
+					code: 0,
+					stdout: "└── pane pane:4\n    └── surface surface:8",
+					stderr: "",
+				};
+			}
+			if (args[0] === "new-surface") {
+				return { code: 0, stdout: "surface:10", stderr: "" };
+			}
+			if (args[0] === "rename-tab") {
+				renameStarted.resolve();
+				await renameGate.promise;
+			}
+			if (args[0] === "respawn-pane") {
+				respawnStarted = true;
+			}
+			return { code: 0, stdout: "", stderr: "" };
+		};
+		const launch = __testing.launchInTerminal(
+			run,
+			{ CMUX_WORKSPACE_ID: "workspace:2", CMUX_SURFACE_ID: "surface:8" },
+			"darwin",
+			{ ...baseRequest, placement: "tab" },
+			"/tmp",
+			argv,
+			"side title",
+		);
+		await renameStarted.promise;
+		expect(respawnStarted).toBe(true);
+		renameGate.resolve();
+		await launch;
+	});
+
 	test("tmux opens a new window when the current one is split", async () => {
 		const fake = runner((_command, args) =>
 			args[0] === "display-message" ? { stdout: "2" } : { stdout: "%9" },
