@@ -501,8 +501,10 @@ async function launchCmux(
 			]),
 		);
 	}
-	await checked(run, "cmux", ["rename-tab", "--surface", target, title]);
-	await checked(run, "cmux", ["respawn-pane", "--surface", target, "--command", command]);
+	await Promise.all([
+		checked(run, "cmux", ["rename-tab", "--surface", target, title]),
+		checked(run, "cmux", ["respawn-pane", "--surface", target, "--command", command]),
+	]);
 	if (restore) {
 		try {
 			await checked(run, "cmux", [
