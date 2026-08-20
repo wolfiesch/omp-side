@@ -296,6 +296,51 @@ function resolveOmp(): string {
 	return "omp";
 }
 
+function resolveProfileFromSessionPath(sessionPath: string): string | undefined {
+	const match = /(?:^|[/\\])profiles[/\\]([^/\\]+)[/\\]agent[/\\]/i.exec(sessionPath);
+	return match?.[1];
+}
+
+function hasProfileArg(ompArgs: readonly string[]): boolean {
+	for (let i = 0; i < ompArgs.length; i++) {
+		const arg = ompArgs[i];
+		if (arg === "--profile" || arg.startsWith("--profile=")) return true;
+	}
+	return false;
+}
+
+function resolveActiveProfile(
+	sessionPath: string,
+	env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+	const fromEnv = env.OMP_PROFILE?.trim() || env.PI_PROFILE?.trim();
+	if (fromEnv) return fromEnv;
+	return resolveProfileFromSessionPath(sessionPath);
+}
+
+function buildChildArgv(
+	ompExecutable: string,
+	cwd: string,
+	childSessionFile: string,
+	request: SideRequest,
+	parentSessionFile: string,
+	env: NodeJS.ProcessEnv = process.env,
+): string[] {
+	const profile = !hasProfileArg(request.ompArgs)
+		? resolveActiveProfile(parentSessionFile, env)
+		: undefined;
+	return [
+		ompExecutable,
+		...(profile ? ["--profile", profile] : []),
+		"--cwd",
+		cwd,
+		"--resume",
+		childSessionFile,
+		...request.ompArgs,
+		...(request.prompt ? [request.prompt] : []),
+	];
+}
+
 type SideSessionManager = Pick<
 	ExtensionContext["sessionManager"],
 	"appendCustomEntry" | "appendMessage" | "getSessionFile" | "close"
@@ -992,15 +1037,14 @@ async function openSide(pi: ExtensionAPI, ctx: ExtensionCommandContext, request:
 		cwd,
 		(sourcePath, childCwd, sessionDir) => managerClass.forkFrom!(sourcePath, childCwd, sessionDir),
 	);
-	const argv = [
+	const argv = buildChildArgv(
 		resolveOmp(),
-		"--cwd",
 		cwd,
-		"--resume",
 		childSessionFile,
-		...request.ompArgs,
-		...(request.prompt ? [request.prompt] : []),
-	];
+		request,
+		sessionFile,
+		process.env,
+	);
 	const launched = await launchInTerminal(
 		createRunner(pi),
 		process.env,
@@ -1099,4 +1143,8 @@ export const __testing = {
 	buildCompletionModels,
 	getSideArgumentCompletions,
 	shQuote,
+	resolveProfileFromSessionPath,
+	hasProfileArg,
+	resolveActiveProfile,
+	buildChildArgv,
 };

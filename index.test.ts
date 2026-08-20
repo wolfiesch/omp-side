@@ -485,3 +485,122 @@ describe("terminal launch adapters", () => {
 		]);
 	});
 });
+
+describe("profile propagation", () => {
+	test("resolves named profile from session paths", () => {
+		expect(
+			__testing.resolveProfileFromSessionPath(
+				"/Users/wolfgangschoenberger/.omp/profiles/ompgem/agent/sessions/--private-tmp--/2026-08-20T10-43-05-598Z_01a01ec4.jsonl",
+			),
+		).toBe("ompgem");
+		expect(
+			__testing.resolveProfileFromSessionPath(
+				"C:\\Users\\user\\.omp\\profiles\\work\\agent\\sessions\\project\\session.jsonl",
+			),
+		).toBe("work");
+		expect(
+			__testing.resolveProfileFromSessionPath(
+				"/Users/wolfgangschoenberger/.omp/agent/sessions/--private-tmp--/session.jsonl",
+			),
+		).toBeUndefined();
+	});
+
+	test("detects profile argument in request flags", () => {
+		expect(__testing.hasProfileArg(["--model", "@slow", "--profile", "ompgpt"])).toBe(true);
+		expect(__testing.hasProfileArg(["--profile=ompgpt"])).toBe(true);
+		expect(__testing.hasProfileArg(["--model", "@slow", "--thinking", "high"])).toBe(false);
+	});
+
+	test("resolves active profile from environment and session path fallback", () => {
+		expect(
+			__testing.resolveActiveProfile("/path/without/profile.jsonl", {
+				OMP_PROFILE: "ompgem",
+			} as NodeJS.ProcessEnv),
+		).toBe("ompgem");
+		expect(
+			__testing.resolveActiveProfile("/path/without/profile.jsonl", {
+				PI_PROFILE: "ompgpt",
+			} as NodeJS.ProcessEnv),
+		).toBe("ompgpt");
+		expect(
+			__testing.resolveActiveProfile(
+				"/Users/user/.omp/profiles/ompgem/agent/sessions/--private-tmp--/session.jsonl",
+				{} as NodeJS.ProcessEnv,
+			),
+		).toBe("ompgem");
+		expect(
+			__testing.resolveActiveProfile(
+				"/Users/user/.omp/agent/sessions/--private-tmp--/session.jsonl",
+				{} as NodeJS.ProcessEnv,
+			),
+		).toBeUndefined();
+	});
+
+	test("buildChildArgv propagates active profile to child command", () => {
+		const request = { ...baseRequest, prompt: "how does this work?" };
+		const argv = __testing.buildChildArgv(
+			"/usr/local/bin/omp",
+			"/tmp",
+			"/sessions/child.jsonl",
+			request,
+			"/Users/user/.omp/profiles/ompgem/agent/sessions/--private-tmp--/parent.jsonl",
+			{} as NodeJS.ProcessEnv,
+		);
+		expect(argv).toEqual([
+			"/usr/local/bin/omp",
+			"--profile",
+			"ompgem",
+			"--cwd",
+			"/tmp",
+			"--resume",
+			"/sessions/child.jsonl",
+			"how does this work?",
+		]);
+	});
+
+	test("buildChildArgv does not duplicate explicit --profile in request", () => {
+		const request = {
+			...baseRequest,
+			ompArgs: ["--profile", "ompgpt"],
+			prompt: "second opinion",
+		};
+		const argv = __testing.buildChildArgv(
+			"/usr/local/bin/omp",
+			"/tmp",
+			"/sessions/child.jsonl",
+			request,
+			"/Users/user/.omp/profiles/ompgem/agent/sessions/--private-tmp--/parent.jsonl",
+			{ OMP_PROFILE: "ompgem" } as NodeJS.ProcessEnv,
+		);
+		expect(argv).toEqual([
+			"/usr/local/bin/omp",
+			"--cwd",
+			"/tmp",
+			"--resume",
+			"/sessions/child.jsonl",
+			"--profile",
+			"ompgpt",
+			"second opinion",
+		]);
+	});
+
+	test("buildChildArgv omits --profile when in default profile", () => {
+		const request = { ...baseRequest, prompt: "question" };
+		const argv = __testing.buildChildArgv(
+			"/usr/local/bin/omp",
+			"/tmp",
+			"/sessions/child.jsonl",
+			request,
+			"/Users/user/.omp/agent/sessions/--private-tmp--/parent.jsonl",
+			{} as NodeJS.ProcessEnv,
+		);
+		expect(argv).toEqual([
+			"/usr/local/bin/omp",
+			"--cwd",
+			"/tmp",
+			"--resume",
+			"/sessions/child.jsonl",
+			"question",
+		]);
+	});
+});
