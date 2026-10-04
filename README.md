@@ -1,6 +1,6 @@
 # omp-side
 
-`/side` for [Oh My Pi](https://github.com/can1357/oh-my-pi), with native launch adapters for [cmux](https://cmux.com), tmux, WezTerm, Kitty, and Ghostty.
+`/side` for [Oh My Pi](https://github.com/can1357/oh-my-pi), with native launch adapters for [cmux](https://cmux.com), tmux, [Tern](https://stencil.so/tern), WezTerm, Kitty, and Ghostty.
 
 Fork the conversation you are in right now, at this exact point, and open the fork nearby. Ask the tangent there. Your main thread stays clean.
 
@@ -30,6 +30,7 @@ the child does can affect the main conversation unless you ask for its first ans
 - One supported terminal environment:
   - cmux
   - tmux
+  - Tern, with the `tern` CLI on `PATH` or Tern.app in `/Applications`
   - WezTerm with `wezterm cli`
   - Kitty with remote control available through `kitten @`
   - Ghostty on macOS or Linux
@@ -102,11 +103,16 @@ Everything stays local. The watcher reads a file on disk and nothing else.
 |---|---|---|---|
 | cmux | New split | New terminal surface tab in the current pane | Exact tab and split direction |
 | tmux | New pane | New tmux window | Exact window and split direction |
+| Tern | New split | New tab in the current session | Exact tab and split direction |
 | WezTerm | New pane | New tab | Exact tab and split direction |
 | Kitty | New Kitty window in the current tab | New tab | Tab or split axis; Kitty's active layout decides final ordering |
 | Ghostty directly | New OS window | New OS window | Ghostty does not expose stable cross-platform tab or split control |
 
 cmux embeds Ghostty but is detected first, so an OMP process inside cmux gets cmux panes and tabs.
+tmux is detected before Tern, so tmux running inside a Tern pane gets tmux panes and windows.
+Tern opens forks without moving focus and then focuses the fork unless `--bg` is set. Left and up
+splits are a right or down split followed by `tern move`, because `tern split` only goes right or
+down.
 Direct Ghostty uses a separate window without keyboard simulation or accessibility scripting.
 Unsupported terminals fail visibly instead of typing a command into an unknown UI.
 
@@ -120,8 +126,8 @@ Unsupported terminals fail visibly instead of typing a command into an unknown U
 5. It appends an empty todo snapshot and a hidden tangent boundary to the child.
 6. The adapter starts `omp --cwd <cwd> --resume <child-session.jsonl> [your flags] [your prompt]`.
 
-Every argument stays separate for WezTerm, Kitty, and Ghostty. cmux and tmux require one POSIX shell
-command string, so each argument is single-quoted independently before launch.
+Every argument stays separate for Tern, WezTerm, Kitty, and Ghostty. cmux and tmux require one POSIX
+shell command string, so each argument is single-quoted independently before launch.
 
 A spawn is recorded in the parent transcript as a custom entry of type `omp-side.spawn`, including
 the selected terminal, placement, and target. The branch point stays visible in session history and
