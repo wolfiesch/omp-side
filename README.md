@@ -59,22 +59,19 @@ Use one method or the other. Both at once registers the command twice.
 /side                                   auto-place an empty side session
 /side --bg -- <prompt>                  open without taking focus
 /side --tab -- <prompt>                 force a new terminal tab
-/side --split -- <prompt>               force another split
-/side --down -- <prompt>                force a split below
+/side --split -- <prompt>               force a split even when no pane has room
+/side --down -- <prompt>                split below only
 /side --pull -- <prompt>                deliver the fork's first answer back here
 /side --model @slow --thinking high -- <prompt>
                                          fork with a different model and reasoning level
 ```
 
-Automatic placement keeps layouts bounded: a one-pane terminal gets one split; if that tab or
-workspace is already split, `/side` opens a new tab instead of subdividing it again.
-
 | Flag | Effect |
 |---|---|
 | `--bg` | Do not steal focus. |
 | `--tab` | Force a new terminal tab. In tmux this is a new window. |
-| `--split` | Force another split even when the current layout is already split. |
-| `--left` `--right` `--up` `--down` | Force a split in that direction. Default direction is `--right`. |
+| `--split` | Split even when no pane meets the minimum size; without a fit, your pane splits to the right. |
+| `--left` `--right` `--up` `--down` | Split in that direction only. The same size search runs on that axis; without a fit, your pane splits anyway. |
 | `--pull` | Watch the fork and attach its first answer to your next message here. |
 | anything else | Passed through to `omp`, so `--model`, `--thinking`, `--tools`, and friends all work. |
 
@@ -88,6 +85,24 @@ role aliases such as `@smol` and `@slow`; `--thinking` offers the supported CLI 
 Choose `--` when you are ready to type the prompt. Earlier options remain intact as each completion
 is accepted, so the whole launch can be built without memorizing flag values.
 
+### Automatic placement
+
+In tmux, Tern, and WezTerm, `/side` reads each pane's size and splits only where both halves stay at
+least 80 columns wide and 30 rows tall. It tries, in order:
+
+1. your pane, side by side;
+2. the largest other pane in the tab, side by side;
+3. your pane, top and bottom;
+4. the largest other pane, top and bottom;
+5. a new tab.
+
+Existing panes are never resized. Tern picture-in-picture panes float over the layout, so they are
+neither split nor counted. Set `OMP_SIDE_MIN_COLS` and `OMP_SIDE_MIN_ROWS` to change the minimum;
+a value that is not a positive whole number fails the command with the variable's name.
+
+cmux and Kitty do not report pane sizes through their CLIs, so they keep a simpler rule: a one-pane
+tab gets one split, and an already split tab gets a new tab.
+
 ## What `--pull` does
 
 The side session runs on its own. With `--pull`, this extension tails the fork's session file, and
@@ -99,14 +114,14 @@ Everything stays local. The watcher reads a file on disk and nothing else.
 
 ## Terminal support
 
-| Environment | One-pane default | Already-split default | Explicit controls |
-|---|---|---|---|
-| cmux | New split | New terminal surface tab in the current pane | Exact tab and split direction |
-| tmux | New pane | New tmux window | Exact window and split direction |
-| Tern | New split | New tab in the current session | Exact tab and split direction |
-| WezTerm | New pane | New tab | Exact tab and split direction |
-| Kitty | New Kitty window in the current tab | New tab | Tab or split axis; Kitty's active layout decides final ordering |
-| Ghostty directly | New OS window | New OS window | Ghostty does not expose stable cross-platform tab or split control |
+| Environment | Automatic placement | Explicit controls |
+|---|---|---|
+| cmux | Split a one-pane workspace; otherwise a new terminal surface tab in the current pane | Exact tab and split direction |
+| tmux | Size-aware split of any pane in the window; otherwise a new tmux window | Exact window and split direction |
+| Tern | Size-aware split of any tiled pane in the tab; otherwise a new tab in the current session | Exact tab and split direction |
+| WezTerm | Size-aware split of any pane in the tab; otherwise a new tab | Exact tab and split direction |
+| Kitty | New Kitty window in a one-window tab; otherwise a new tab | Tab or split axis; Kitty's active layout decides final ordering |
+| Ghostty directly | New OS window | Ghostty does not expose stable cross-platform tab or split control |
 
 cmux embeds Ghostty but is detected first, so an OMP process inside cmux gets cmux panes and tabs.
 tmux is detected before Tern, so tmux running inside a Tern pane gets tmux panes and windows.
@@ -120,7 +135,8 @@ Unsupported terminals fail visibly instead of typing a command into an unknown U
 
 1. `ctx.sessionManager.getSessionFile()` gives the live session's `.jsonl` path.
 2. The extension detects the innermost supported multiplexer or terminal from its environment.
-3. The adapter counts panes in the current tab or workspace and selects a split or tab.
+3. The adapter reads the current tab's panes (with sizes where the terminal reports them) and
+   selects a split target and direction, or a tab.
 4. The extension forks the transcript into a new session file, recording `parentSession` and
    `providerPromptCacheKey` pointing at the parent.
 5. It appends an empty todo snapshot and a hidden tangent boundary to the child.

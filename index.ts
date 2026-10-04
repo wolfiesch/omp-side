@@ -45,7 +45,8 @@ interface SideRequest {
 	focus: boolean;
 	placement: Placement;
 	pull: boolean;
-	direction: Direction;
+	/** Set only by an explicit direction flag; automatic placement may choose either axis. */
+	direction?: Direction;
 	ompArgs: string[];
 	prompt: string;
 }
@@ -227,7 +228,6 @@ function parseRequest(raw: string): SideRequest {
 		focus: true,
 		placement: "auto",
 		pull: false,
-		direction: "right",
 		ompArgs: [],
 		prompt: "",
 	};
@@ -460,6 +460,76 @@ function choosePlacement(requested: Placement, paneCount: number): "split" | "ta
 	return paneCount > 1 ? "tab" : "split";
 }
 
+interface PaneGeometry {
+	id: string;
+	cols: number;
+	rows: number;
+}
+
+interface PlacementLimits {
+	cols: number;
+	rows: number;
+}
+
+type PlacementPlan = { placement: "tab" } | { placement: "split"; pane: string; direction: Direction };
+
+const DEFAULT_MIN_COLS = 80;
+const DEFAULT_MIN_ROWS = 30;
+
+function positiveIntEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+	const raw = env[name]?.trim();
+	if (!raw) return fallback;
+	const value = Number(raw);
+	if (!Number.isInteger(value) || value < 1) {
+		throw new Error(`${name} must be a positive whole number of terminal cells, got "${raw}"`);
+	}
+	return value;
+}
+
+function placementLimits(env: NodeJS.ProcessEnv): PlacementLimits {
+	return {
+		cols: positiveIntEnv(env, "OMP_SIDE_MIN_COLS", DEFAULT_MIN_COLS),
+		rows: positiveIntEnv(env, "OMP_SIDE_MIN_ROWS", DEFAULT_MIN_ROWS),
+	};
+}
+
+/** Both halves of a split must meet the minimum; one cell goes to the divider. */
+function splitFits(pane: PaneGeometry, horizontal: boolean, limits: PlacementLimits): boolean {
+	return horizontal
+		? Math.floor((pane.cols - 1) / 2) >= limits.cols && pane.rows >= limits.rows
+		: Math.floor((pane.rows - 1) / 2) >= limits.rows && pane.cols >= limits.cols;
+}
+
+/**
+ * Geometry-aware placement. Candidates, first fit wins: the source pane side by side, the
+ * largest other pane side by side, the source stacked, the largest other pane stacked. An
+ * explicit direction restricts the search to that axis. Without a fit, automatic placement
+ * opens a tab and a forced split divides the source pane anyway.
+ */
+function planPlacement(
+	request: Pick<SideRequest, "placement" | "direction">,
+	sourceId: string,
+	panes: PaneGeometry[],
+	limits: PlacementLimits,
+): PlacementPlan {
+	if (request.placement === "tab") return { placement: "tab" };
+	const source = panes.find((pane) => pane.id === sourceId);
+	const largestFirst = panes
+		.filter((pane) => pane.id !== sourceId)
+		.sort((a, b) => b.cols * b.rows - a.cols * a.rows);
+	const candidates = source ? [source, ...largestFirst] : largestFirst;
+	const directions: Direction[] = request.direction ? [request.direction] : ["right", "down"];
+	for (const direction of directions) {
+		const horizontal = direction === "left" || direction === "right";
+		const pane = candidates.find((candidate) => splitFits(candidate, horizontal, limits));
+		if (pane) return { placement: "split", pane: pane.id, direction };
+	}
+	if (request.placement === "split") {
+		return { placement: "split", pane: sourceId, direction: request.direction ?? "right" };
+	}
+	return { placement: "tab" };
+}
+
 function cmuxLayout(tree: string, surface: string | undefined): {
 	paneCount: number;
 	ownerPane: string | null;
@@ -537,7 +607,7 @@ async function launchCmux(
 		target = surfaceRef(
 			await checked(run, "cmux", [
 				"new-split",
-				request.direction,
+				request.direction ?? "right",
 				"--workspace",
 				workspace,
 				...(sourceSurface ? ["--surface", sourceSurface] : []),
@@ -574,19 +644,29 @@ async function launchTmux(
 	argv: string[],
 	title: string,
 ): Promise<LaunchResult> {
-	const sourcePane = env.TMUX_PANE;
-	const countText = await checked(run, "tmux", [
-		"display-message",
-		"-p",
-		...(sourcePane ? ["-t", sourcePane] : []),
-		"#{window_panes}",
+	const listing = await checked(run, "tmux", [
+		"list-panes",
+		...(env.TMUX_PANE ? ["-t", env.TMUX_PANE] : []),
+		"-F",
+		"#{pane_id} #{pane_width} #{pane_height} #{pane_active}",
 	]);
-	const paneCount = Number.parseInt(countText, 10);
-	if (!Number.isFinite(paneCount)) throw new Error(`unexpected tmux pane count: ${countText}`);
-	const placement = choosePlacement(request.placement, paneCount);
+	let sourcePane = env.TMUX_PANE;
+	const panes: PaneGeometry[] = [];
+	for (const line of listing.split("\n")) {
+		const [id, cols, rows, active] = line.trim().split(" ");
+		if (!id) continue;
+		const geometry = { id, cols: Number(cols), rows: Number(rows) };
+		if (!Number.isFinite(geometry.cols) || !Number.isFinite(geometry.rows)) {
+			throw new Error(`unexpected tmux list-panes line: ${line}`);
+		}
+		panes.push(geometry);
+		if (!sourcePane && active === "1") sourcePane = id;
+	}
+	if (!sourcePane) throw new Error("tmux list-panes returned no active pane");
+	const plan = planPlacement(request, sourcePane, panes, placementLimits(env));
 	const command = argv.map(shQuote).join(" ");
 	const args =
-		placement === "tab"
+		plan.placement === "tab"
 			? [
 					"new-window",
 					"-P",
@@ -606,18 +686,23 @@ async function launchTmux(
 					"#{pane_id}",
 					"-c",
 					cwd,
-					...(sourcePane ? ["-t", sourcePane] : []),
-					...(request.direction === "left" || request.direction === "right" ? ["-h"] : []),
-					...(request.direction === "left" || request.direction === "up" ? ["-b"] : []),
+					"-t",
+					plan.pane,
+					...(plan.direction === "left" || plan.direction === "right" ? ["-h"] : []),
+					...(plan.direction === "left" || plan.direction === "up" ? ["-b"] : []),
 					...(!request.focus ? ["-d"] : []),
 					command,
 				];
 	const target = await checked(run, "tmux", args);
-	return { target, terminal: "tmux", placement };
+	return { target, terminal: "tmux", placement: plan.placement };
 }
 
 interface TernBlock {
 	id: number;
+	cols?: number;
+	rows?: number;
+	/** Set on picture-in-picture panes, which float over the tiled layout. */
+	pip?: unknown;
 }
 
 interface TernTab {
@@ -645,7 +730,8 @@ function ternBlockId(output: string): number {
 /**
  * Tern's CLI leaves focus where it is for both `split` and `new tab`, so `--bg` needs no
  * restore step and a focused fork is one explicit `tern focus`. `split` only goes right or
- * down; left and up are a right/down split followed by `move`.
+ * down; left and up are a right/down split followed by `move`. Picture-in-picture panes float
+ * over the layout, so they are neither split candidates nor counted against it.
  */
 async function launchTern(
 	run: Runner,
@@ -670,33 +756,30 @@ async function launchTern(
 		}
 	}
 	if (!session || !tab) throw new Error(`Tern block ${sourcePane} was not returned by tern inspect`);
-	const placement = choosePlacement(request.placement, tab.blocks?.length ?? 1);
+	const tiled: PaneGeometry[] = (tab.blocks ?? [])
+		.filter((block) => block.pip == null && typeof block.cols === "number" && typeof block.rows === "number")
+		.map((block) => ({ id: String(block.id), cols: block.cols as number, rows: block.rows as number }));
+	const plan = planPlacement(request, String(sourcePane), tiled, placementLimits(env));
 	const launch = ["--json", "--cwd", cwd, "--", ...argv];
 	let target: number;
-	if (placement === "tab") {
+	if (plan.placement === "tab") {
 		target = ternBlockId(await checked(run, tern, ["new", "tab", String(session.id), ...launch]));
 		await checked(run, tern, ["rename", String(target), title]);
 	} else {
-		const horizontal = request.direction === "left" || request.direction === "right";
-		target = ternBlockId(
-			await checked(run, tern, ["split", String(sourcePane), horizontal ? "right" : "down", ...launch]),
-		);
-		if (request.direction === "left" || request.direction === "up") {
-			await checked(run, tern, [
-				"move",
-				String(target),
-				request.direction === "left" ? "left-of" : "above",
-				String(sourcePane),
-			]);
+		const horizontal = plan.direction === "left" || plan.direction === "right";
+		target = ternBlockId(await checked(run, tern, ["split", plan.pane, horizontal ? "right" : "down", ...launch]));
+		if (plan.direction === "left" || plan.direction === "up") {
+			await checked(run, tern, ["move", String(target), plan.direction === "left" ? "left-of" : "above", plan.pane]);
 		}
 	}
 	if (request.focus) await checked(run, tern, ["focus", String(target)]);
-	return { target: `block:${target}`, terminal: "tern", placement };
+	return { target: `block:${target}`, terminal: "tern", placement: plan.placement };
 }
 
 interface WezPane {
 	pane_id: number;
 	tab_id: number;
+	size?: { cols: number; rows: number };
 }
 
 async function launchWezTerm(
@@ -711,22 +794,14 @@ async function launchWezTerm(
 	const panes = JSON.parse(await checked(run, "wezterm", ["cli", "list", "--format", "json"])) as WezPane[];
 	const source = panes.find((pane) => pane.pane_id === sourcePane);
 	if (!source) throw new Error(`WezTerm pane ${sourcePane} was not returned by wezterm cli list`);
-	const paneCount = panes.filter((pane) => pane.tab_id === source.tab_id).length;
-	const placement = choosePlacement(request.placement, paneCount);
+	const tabPanes: PaneGeometry[] = panes
+		.filter((pane) => pane.tab_id === source.tab_id && pane.size)
+		.map((pane) => ({ id: String(pane.pane_id), cols: pane.size?.cols ?? 0, rows: pane.size?.rows ?? 0 }));
+	const plan = planPlacement(request, String(sourcePane), tabPanes, placementLimits(env));
 	const args =
-		placement === "tab"
+		plan.placement === "tab"
 			? ["cli", "spawn", "--pane-id", String(sourcePane), "--cwd", cwd, "--", ...argv]
-			: [
-					"cli",
-					"split-pane",
-					`--${request.direction}`,
-					"--pane-id",
-					String(sourcePane),
-					"--cwd",
-					cwd,
-					"--",
-					...argv,
-				];
+			: ["cli", "split-pane", `--${plan.direction}`, "--pane-id", plan.pane, "--cwd", cwd, "--", ...argv];
 	const target = await checked(run, "wezterm", args);
 	if (!request.focus) {
 		try {
@@ -735,7 +810,7 @@ async function launchWezTerm(
 			// The source may have closed while the fork was starting.
 		}
 	}
-	return { target, terminal: "wezterm", placement };
+	return { target, terminal: "wezterm", placement: plan.placement };
 }
 
 interface KittyWindow {
@@ -779,7 +854,7 @@ async function launchKitty(
 		...(placement === "tab" ? ["--tab-title", title] : ["--title", title]),
 		...(!request.focus ? ["--keep-focus"] : []),
 		...(placement === "split"
-			? ["--location", request.direction === "left" || request.direction === "right" ? "vsplit" : "hsplit"]
+			? ["--location", request.direction === "up" || request.direction === "down" ? "hsplit" : "vsplit"]
 			: []),
 		...argv,
 	];
@@ -1115,7 +1190,6 @@ export default function ompSide(pi: ExtensionAPI) {
 					focus: true,
 					placement: "auto",
 					pull: false,
-					direction: "right",
 					ompArgs: [],
 					prompt: "",
 				});
@@ -1134,6 +1208,8 @@ export const __testing = {
 	USER_TODO_EDIT_ENTRY,
 	SIDE_CONTEXT_SWITCH,
 	choosePlacement,
+	planPlacement,
+	placementLimits,
 	cmuxLayout,
 	pathWithExecutableDir,
 	commandWithRuntimePath,
