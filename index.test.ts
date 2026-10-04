@@ -24,7 +24,6 @@ const baseRequest = {
 	focus: true,
 	placement: "auto" as const,
 	pull: false,
-	direction: "right" as const,
 	ompArgs: [],
 	prompt: "",
 };
@@ -38,7 +37,8 @@ describe("request parsing", () => {
 	});
 
 	test("explicit directions force a split and tab remains explicit", () => {
-		expect(__testing.parseRequest("--left -- question").placement).toBe("split");
+		expect(__testing.parseRequest("--left -- question")).toMatchObject({ placement: "split", direction: "left" });
+		expect(__testing.parseRequest("--split -- question").direction).toBeUndefined();
 		expect(__testing.parseRequest("--tab -- question").placement).toBe("tab");
 	});
 
@@ -214,10 +214,81 @@ describe("child command PATH", () => {
 });
 
 describe("automatic placement", () => {
-	test("uses a tab once the current layout already has a split", () => {
+	test("pane-count fallback uses a tab once the current layout already has a split", () => {
 		expect(__testing.choosePlacement("auto", 2)).toBe("tab");
 		expect(__testing.choosePlacement("auto", 1)).toBe("split");
 		expect(__testing.choosePlacement("split", 4)).toBe("split");
+	});
+
+	const limits = { cols: 80, rows: 30 };
+	const pane = (id: string, cols: number, rows: number) => ({ id, cols, rows });
+	const auto = { placement: "auto" as const };
+
+	test.each([
+		["one wide pane splits beside itself", auto, [pane("s", 288, 85)], { placement: "split", pane: "s", direction: "right" }],
+		[
+			"a narrow source splits the largest pane that fits side by side",
+			auto,
+			[pane("s", 107, 93), pane("big", 208, 93), pane("mid", 170, 93)],
+			{ placement: "split", pane: "big", direction: "right" },
+		],
+		[
+			"two full columns stack below the source before trying other panes",
+			auto,
+			[pane("s", 142, 85), pane("o", 142, 85)],
+			{ placement: "split", pane: "s", direction: "down" },
+		],
+		[
+			"a short source stacks below the largest tall pane",
+			auto,
+			[pane("s", 142, 40), pane("o", 142, 85)],
+			{ placement: "split", pane: "o", direction: "down" },
+		],
+		["a pane too small for either half opens a tab", auto, [pane("s", 120, 40)], { placement: "tab" }],
+		[
+			"an explicit direction only searches its own axis",
+			{ placement: "split" as const, direction: "up" as const },
+			[pane("s", 288, 85)],
+			{ placement: "split", pane: "s", direction: "up" },
+		],
+		[
+			"an explicit direction keeps left on another pane",
+			{ placement: "split" as const, direction: "left" as const },
+			[pane("s", 100, 85), pane("o", 180, 85)],
+			{ placement: "split", pane: "o", direction: "left" },
+		],
+		[
+			"a forced split without a fit divides the source in the requested direction",
+			{ placement: "split" as const, direction: "left" as const },
+			[pane("s", 142, 85), pane("o", 142, 85)],
+			{ placement: "split", pane: "s", direction: "left" },
+		],
+		[
+			"--split without a fit divides the source to the right",
+			{ placement: "split" as const },
+			[pane("s", 120, 40)],
+			{ placement: "split", pane: "s", direction: "right" },
+		],
+		["--tab wins over available space", { placement: "tab" as const }, [pane("s", 288, 85)], { placement: "tab" }],
+	])("%s", (_name, request, panes, expected) => {
+		expect(__testing.planPlacement(request, "s", panes, limits)).toEqual(expected);
+	});
+
+	test("the divider cell counts against each half", () => {
+		expect(__testing.planPlacement(auto, "s", [pane("s", 161, 30)], limits)).toMatchObject({ direction: "right" });
+		expect(__testing.planPlacement(auto, "s", [pane("s", 160, 30)], limits)).toEqual({ placement: "tab" });
+		expect(__testing.planPlacement(auto, "s", [pane("s", 80, 61)], limits)).toMatchObject({ direction: "down" });
+		expect(__testing.planPlacement(auto, "s", [pane("s", 80, 60)], limits)).toEqual({ placement: "tab" });
+	});
+
+	test("minimum pane size comes from the environment and rejects invalid values", () => {
+		expect(__testing.placementLimits({})).toEqual({ cols: 80, rows: 30 });
+		expect(__testing.placementLimits({ OMP_SIDE_MIN_COLS: "60", OMP_SIDE_MIN_ROWS: " 20 " })).toEqual({
+			cols: 60,
+			rows: 20,
+		});
+		expect(() => __testing.placementLimits({ OMP_SIDE_MIN_COLS: "wide" })).toThrow(/OMP_SIDE_MIN_COLS/);
+		expect(() => __testing.placementLimits({ OMP_SIDE_MIN_ROWS: "0" })).toThrow(/OMP_SIDE_MIN_ROWS/);
 	});
 
 	test("maps a cmux surface back to its owning pane", () => {
@@ -302,9 +373,9 @@ describe("terminal launch adapters", () => {
 		await launch;
 	});
 
-	test("tmux opens a new window when the current one is split", async () => {
+	test("tmux opens a new window when no pane in the window has room", async () => {
 		const fake = runner((_command, args) =>
-			args[0] === "display-message" ? { stdout: "2" } : { stdout: "%9" },
+			args[0] === "list-panes" ? { stdout: "%1 100 40 1\n%2 100 40 0\n" } : { stdout: "%9" },
 		);
 		const result = await __testing.launchInTerminal(
 			fake.run,
@@ -317,13 +388,43 @@ describe("terminal launch adapters", () => {
 		);
 
 		expect(result).toEqual({ target: "%9", terminal: "tmux", placement: "tab" });
+		expect(fake.calls[0].args.slice(0, 3)).toEqual(["list-panes", "-t", "%1"]);
 		expect(fake.calls[1].args[0]).toBe("new-window");
 	});
 
-	test("WezTerm splits a single-pane tab with structured command arguments", async () => {
+	test("tmux splits a roomier sibling pane in the background", async () => {
+		const fake = runner((_command, args) =>
+			args[0] === "list-panes" ? { stdout: "%1 100 60 1\n%2 200 60 0\n" } : { stdout: "%9" },
+		);
+		const result = await __testing.launchInTerminal(
+			fake.run,
+			{ TMUX: "/tmp/tmux" },
+			"linux",
+			{ ...baseRequest, focus: false },
+			"/tmp/a b",
+			argv,
+			"side title",
+		);
+
+		expect(result).toEqual({ target: "%9", terminal: "tmux", placement: "split" });
+		expect(fake.calls[1].args.slice(0, -1)).toEqual([
+			"split-window",
+			"-P",
+			"-F",
+			"#{pane_id}",
+			"-c",
+			"/tmp/a b",
+			"-t",
+			"%2",
+			"-h",
+			"-d",
+		]);
+	});
+
+	test("WezTerm splits a roomy single-pane tab with structured command arguments", async () => {
 		const fake = runner((_command, args) =>
 			args[1] === "list"
-				? { stdout: JSON.stringify([{ pane_id: 7, tab_id: 3 }]) }
+				? { stdout: JSON.stringify([{ pane_id: 7, tab_id: 3, size: { cols: 200, rows: 50 } }]) }
 				: { stdout: "8" },
 		);
 		const result = await __testing.launchInTerminal(
@@ -350,18 +451,22 @@ describe("terminal launch adapters", () => {
 		]);
 	});
 
-	const ternTree = (blocks: number[]) =>
+	type TernFixtureBlock = [id: number, cols: number, rows: number, pip?: object];
+	const ternTree = (blocks: TernFixtureBlock[]) =>
 		JSON.stringify({
 			sessions: [
-				{ id: 1, tabs: [{ blocks: [{ id: 2 }] }] },
-				{ id: 40, tabs: [{ blocks: blocks.map((id) => ({ id })) }] },
+				{ id: 1, tabs: [{ blocks: [{ id: 2, cols: 300, rows: 90 }] }] },
+				{
+					id: 40,
+					tabs: [{ blocks: blocks.map(([id, cols, rows, pip]) => ({ id, cols, rows, pip: pip ?? null })) }],
+				},
 			],
 		});
 
 	test("Tern splits a single-pane tab to the left, then focuses the fork", async () => {
 		const fake = runner((_command, args) =>
 			args[0] === "inspect"
-				? { stdout: ternTree([41]) }
+				? { stdout: ternTree([[41, 288, 85]]) }
 				: args[0] === "split"
 					? { stdout: JSON.stringify({ session: 40, tab: 50, block: 42 }) }
 					: {},
@@ -384,10 +489,10 @@ describe("terminal launch adapters", () => {
 		]);
 	});
 
-	test("Tern opens a background tab in the source session once the tab is split", async () => {
+	test("Tern opens a background tab in the source session when no pane has room", async () => {
 		const fake = runner((_command, args) =>
 			args[0] === "inspect"
-				? { stdout: ternTree([41, 43]) }
+				? { stdout: ternTree([[41, 100, 40], [43, 100, 40]]) }
 				: args[0] === "new"
 					? { stdout: JSON.stringify({ session: 40, tab: 51, block: 44 }) }
 					: {},
@@ -406,6 +511,30 @@ describe("terminal launch adapters", () => {
 		expect(fake.calls.slice(1).map((call) => call.args)).toEqual([
 			["new", "tab", "40", "--json", "--cwd", "/tmp/a b", "--", ...argv],
 			["rename", "44", "side title"],
+		]);
+	});
+
+	test("Tern splits a wide sibling when the source is too narrow and ignores picture-in-picture panes", async () => {
+		const fake = runner((_command, args) =>
+			args[0] === "inspect"
+				? { stdout: ternTree([[41, 107, 93], [43, 208, 93], [45, 300, 90, { owner: 43, corner: "br" }]]) }
+				: args[0] === "split"
+					? { stdout: JSON.stringify({ session: 40, tab: 50, block: 46 }) }
+					: {},
+		);
+		const result = await __testing.launchInTerminal(
+			fake.run,
+			{ TERM_PROGRAM: "tern", TERN_PANE: "41" },
+			"linux",
+			{ ...baseRequest, focus: false },
+			"/tmp/a b",
+			argv,
+			"side title",
+		);
+
+		expect(result).toEqual({ target: "block:46", terminal: "tern", placement: "split" });
+		expect(fake.calls.slice(1).map((call) => call.args)).toEqual([
+			["split", "43", "right", "--json", "--cwd", "/tmp/a b", "--", ...argv],
 		]);
 	});
 
