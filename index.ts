@@ -38,7 +38,8 @@ const TERMINAL_TIMEOUT_MS = 15_000;
 
 type Direction = "right" | "left" | "up" | "down";
 type Placement = "auto" | "split" | "tab";
-type TerminalKind = "cmux" | "tmux" | "wezterm" | "kitty" | "ghostty";
+type TerminalKind = "cmux" | "tmux" | "tern" | "wezterm" | "kitty" | "ghostty";
+const TERN_APP_BINARY = "/Applications/Tern.app/Contents/MacOS/tern";
 
 interface SideRequest {
 	focus: boolean;
@@ -401,6 +402,7 @@ function commandWithRuntimePath(argv: string[], path: string | undefined, execut
 function detectTerminal(env: NodeJS.ProcessEnv): TerminalKind | null {
 	if (env.CMUX_WORKSPACE_ID) return "cmux";
 	if (env.TMUX) return "tmux";
+	if (env.TERM_PROGRAM?.toLowerCase() === "tern" && env.TERN_PANE) return "tern";
 	if (env.WEZTERM_PANE) return "wezterm";
 	if (env.KITTY_WINDOW_ID) return "kitty";
 	if (env.TERM_PROGRAM?.toLowerCase() === "ghostty" || env.GHOSTTY_RESOURCES_DIR) return "ghostty";
@@ -567,6 +569,84 @@ async function launchTmux(
 	return { target, terminal: "tmux", placement };
 }
 
+interface TernBlock {
+	id: number;
+}
+
+interface TernTab {
+	blocks?: TernBlock[];
+}
+
+interface TernSession {
+	id: number;
+	tabs?: TernTab[];
+}
+
+function resolveTern(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
+	const onPath = resolveOnPath(["tern"], env.PATH);
+	if (onPath !== "tern" || platform !== "darwin") return onPath;
+	return existsSync(TERN_APP_BINARY) ? TERN_APP_BINARY : onPath;
+}
+
+function ternBlockId(output: string): number {
+	const parsed: unknown = JSON.parse(output);
+	const block = parsed && typeof parsed === "object" && "block" in parsed ? parsed.block : undefined;
+	if (typeof block !== "number") throw new Error(`unexpected tern output: ${output}`);
+	return block;
+}
+
+/**
+ * Tern's CLI leaves focus where it is for both `split` and `new tab`, so `--bg` needs no
+ * restore step and a focused fork is one explicit `tern focus`. `split` only goes right or
+ * down; left and up are a right/down split followed by `move`.
+ */
+async function launchTern(
+	run: Runner,
+	env: NodeJS.ProcessEnv,
+	platform: NodeJS.Platform,
+	request: SideRequest,
+	cwd: string,
+	argv: string[],
+	title: string,
+): Promise<LaunchResult> {
+	const sourcePane = Number.parseInt(env.TERN_PANE ?? "", 10);
+	if (!Number.isFinite(sourcePane)) throw new Error("TERN_PANE is invalid");
+	const tern = resolveTern(env, platform);
+	const tree = JSON.parse(await checked(run, tern, ["inspect", "--json"])) as { sessions?: TernSession[] };
+	let session: TernSession | undefined;
+	let tab: TernTab | undefined;
+	for (const candidate of tree.sessions ?? []) {
+		tab = candidate.tabs?.find((t) => t.blocks?.some((block) => block.id === sourcePane));
+		if (tab) {
+			session = candidate;
+			break;
+		}
+	}
+	if (!session || !tab) throw new Error(`Tern block ${sourcePane} was not returned by tern inspect`);
+	const placement = choosePlacement(request.placement, tab.blocks?.length ?? 1);
+	const launch = ["--json", "--cwd", cwd, "--", ...argv];
+	let target: number;
+	if (placement === "tab") {
+		target = ternBlockId(await checked(run, tern, ["new", "tab", String(session.id), ...launch]));
+		await checked(run, tern, ["rename", String(target), title]);
+	} else {
+		const horizontal = request.direction === "left" || request.direction === "right";
+		target = ternBlockId(
+			await checked(run, tern, ["split", String(sourcePane), horizontal ? "right" : "down", ...launch]),
+		);
+		if (request.direction === "left" || request.direction === "up") {
+			await checked(run, tern, [
+				"move",
+				String(target),
+				request.direction === "left" ? "left-of" : "above",
+				String(sourcePane),
+			]);
+		}
+	}
+	if (request.focus) await checked(run, tern, ["focus", String(target)]);
+	return { target: `block:${target}`, terminal: "tern", placement };
+}
+
 interface WezPane {
 	pane_id: number;
 	tab_id: number;
@@ -696,6 +776,8 @@ async function launchInTerminal(
 			return launchCmux(run, env, request, cwd, command, title);
 		case "tmux":
 			return launchTmux(run, env, request, cwd, command, title);
+		case "tern":
+			return launchTern(run, env, platform, request, cwd, command, title);
 		case "wezterm":
 			return launchWezTerm(run, env, request, cwd, command);
 		case "kitty":
@@ -704,7 +786,7 @@ async function launchInTerminal(
 			return launchGhostty(run, platform, cwd, command);
 		default:
 			throw new Error(
-				"unsupported terminal: use cmux, tmux, WezTerm, Kitty, or Ghostty (direct Ghostty opens a new window)",
+				"unsupported terminal: use cmux, tmux, Tern, WezTerm, Kitty, or Ghostty (direct Ghostty opens a new window)",
 			);
 	}
 }

@@ -188,10 +188,15 @@ describe("terminal detection", () => {
 		);
 	});
 
+	test("prefers tmux running inside a Tern pane", () => {
+		expect(__testing.detectTerminal({ TMUX: "/tmp/tmux", TERM_PROGRAM: "tern", TERN_PANE: "9" })).toBe("tmux");
+	});
+
 	test("recognizes direct terminal integrations", () => {
 		expect(__testing.detectTerminal({ WEZTERM_PANE: "2" })).toBe("wezterm");
 		expect(__testing.detectTerminal({ KITTY_WINDOW_ID: "3" })).toBe("kitty");
 		expect(__testing.detectTerminal({ TERM_PROGRAM: "ghostty" })).toBe("ghostty");
+		expect(__testing.detectTerminal({ TERM_PROGRAM: "tern", TERN_PANE: "9" })).toBe("tern");
 	});
 });
 
@@ -303,6 +308,65 @@ describe("terminal launch adapters", () => {
 			"/tmp/a b",
 			"--",
 			...argv,
+		]);
+	});
+
+	const ternTree = (blocks: number[]) =>
+		JSON.stringify({
+			sessions: [
+				{ id: 1, tabs: [{ blocks: [{ id: 2 }] }] },
+				{ id: 40, tabs: [{ blocks: blocks.map((id) => ({ id })) }] },
+			],
+		});
+
+	test("Tern splits a single-pane tab to the left, then focuses the fork", async () => {
+		const fake = runner((_command, args) =>
+			args[0] === "inspect"
+				? { stdout: ternTree([41]) }
+				: args[0] === "split"
+					? { stdout: JSON.stringify({ session: 40, tab: 50, block: 42 }) }
+					: {},
+		);
+		const result = await __testing.launchInTerminal(
+			fake.run,
+			{ TERM_PROGRAM: "tern", TERN_PANE: "41" },
+			"linux",
+			{ ...baseRequest, direction: "left" },
+			"/tmp/a b",
+			argv,
+			"side title",
+		);
+
+		expect(result).toEqual({ target: "block:42", terminal: "tern", placement: "split" });
+		expect(fake.calls.slice(1).map((call) => call.args)).toEqual([
+			["split", "41", "right", "--json", "--cwd", "/tmp/a b", "--", ...argv],
+			["move", "42", "left-of", "41"],
+			["focus", "42"],
+		]);
+	});
+
+	test("Tern opens a background tab in the source session once the tab is split", async () => {
+		const fake = runner((_command, args) =>
+			args[0] === "inspect"
+				? { stdout: ternTree([41, 43]) }
+				: args[0] === "new"
+					? { stdout: JSON.stringify({ session: 40, tab: 51, block: 44 }) }
+					: {},
+		);
+		const result = await __testing.launchInTerminal(
+			fake.run,
+			{ TERM_PROGRAM: "tern", TERN_PANE: "41" },
+			"linux",
+			{ ...baseRequest, focus: false },
+			"/tmp/a b",
+			argv,
+			"side title",
+		);
+
+		expect(result).toEqual({ target: "block:44", terminal: "tern", placement: "tab" });
+		expect(fake.calls.slice(1).map((call) => call.args)).toEqual([
+			["new", "tab", "40", "--json", "--cwd", "/tmp/a b", "--", ...argv],
+			["rename", "44", "side title"],
 		]);
 	});
 
