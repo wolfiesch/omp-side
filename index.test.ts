@@ -221,6 +221,7 @@ describe("automatic placement", () => {
 	});
 
 	const limits = { cols: 80, rows: 30 };
+	const aspect = 2;
 	const pane = (id: string, cols: number, rows: number) => ({ id, cols, rows });
 	const auto = { placement: "auto" as const };
 
@@ -289,14 +290,15 @@ describe("automatic placement", () => {
 		],
 		["--tab wins over available space", { placement: "tab" as const }, [pane("s", 288, 85)], { placement: "tab" }],
 	])("%s", (_name, request, panes, expected) => {
-		expect(__testing.planPlacement(request, "s", panes, limits)).toEqual(expected);
+		expect(__testing.planPlacement(request, "s", panes, limits, aspect)).toEqual(expected);
 	});
 
 	test("the divider cell counts against each half", () => {
-		expect(__testing.planPlacement(auto, "s", [pane("s", 161, 30)], limits)).toMatchObject({ direction: "right" });
-		expect(__testing.planPlacement(auto, "s", [pane("s", 160, 30)], limits)).toEqual({ placement: "tab" });
-		expect(__testing.planPlacement(auto, "s", [pane("s", 80, 61)], limits)).toMatchObject({ direction: "down" });
-		expect(__testing.planPlacement(auto, "s", [pane("s", 80, 60)], limits)).toEqual({ placement: "tab" });
+		const plan = (cols: number, rows: number) => __testing.planPlacement(auto, "s", [pane("s", cols, rows)], limits, aspect);
+		expect(plan(161, 30)).toMatchObject({ direction: "right" });
+		expect(plan(160, 30)).toEqual({ placement: "tab" });
+		expect(plan(80, 61)).toMatchObject({ direction: "down" });
+		expect(plan(80, 60)).toEqual({ placement: "tab" });
 	});
 
 	test("minimum pane size comes from the environment and rejects invalid values", () => {
@@ -470,7 +472,8 @@ describe("terminal launch adapters", () => {
 	});
 
 	type TernFixtureBlock = [id: number, cols: number, rows: number, pip?: object];
-	const ternTree = (blocks: TernFixtureBlock[]) =>
+	type TernFixturePixels = { pane: number; cols: number; rows: number; width: number; height: number };
+	const ternTree = (blocks: TernFixtureBlock[], panes: TernFixturePixels[] = []) =>
 		JSON.stringify({
 			sessions: [
 				{ id: 1, tabs: [{ blocks: [{ id: 2, cols: 300, rows: 90 }] }] },
@@ -479,7 +482,35 @@ describe("terminal launch adapters", () => {
 					tabs: [{ blocks: blocks.map(([id, cols, rows, pip]) => ({ id, cols, rows, pip: pip ?? null })) }],
 				},
 			],
+			panes,
 		});
+
+	test.each([
+		["without pixel data the default 2:1 cell splits side by side", [], "right"],
+		[
+			"tall 8x17 px cells make the same pane taller on screen, so it stacks",
+			[{ pane: 41, cols: 200, rows: 100, width: 1600, height: 1700 }],
+			"down",
+		],
+	] as const)("Tern uses the source pane's pixel size: %s", async (_name, pixels, direction) => {
+		const fake = runner((_command, args) =>
+			args[0] === "inspect"
+				? { stdout: ternTree([[41, 200, 100]], [...pixels]) }
+				: args[0] === "split"
+					? { stdout: JSON.stringify({ session: 40, tab: 50, block: 42 }) }
+					: {},
+		);
+		await __testing.launchInTerminal(
+			fake.run,
+			{ TERM_PROGRAM: "tern", TERN_PANE: "41" },
+			"linux",
+			{ ...baseRequest, focus: false },
+			"/tmp",
+			argv,
+			"side title",
+		);
+		expect(fake.calls[1].args.slice(0, 3)).toEqual(["split", "41", direction]);
+	});
 
 	test("Tern splits a single-pane tab to the left, then focuses the fork", async () => {
 		const fake = runner((_command, args) =>
@@ -552,7 +583,7 @@ describe("terminal launch adapters", () => {
 
 		expect(result).toEqual({ target: "block:46", terminal: "tern", placement: "split" });
 		expect(fake.calls.slice(1).map((call) => call.args)).toEqual([
-			["split", "43", "down", "--json", "--cwd", "/tmp/a b", "--", ...argv],
+			["split", "43", "right", "--json", "--cwd", "/tmp/a b", "--", ...argv],
 		]);
 	});
 

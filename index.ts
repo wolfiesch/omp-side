@@ -494,68 +494,85 @@ function placementLimits(env: NodeJS.ProcessEnv): PlacementLimits {
 }
 
 /**
- * Room left in the tighter half of a split, in units of the minimum pane: the smaller of
- * half-width over minimum columns and half-height over minimum rows, with one cell for the
- * divider. Both halves fit when it is at least 1. Scaling by the minimum keeps the comparison
- * honest about cell shape: a cell is about twice as tall as it is wide, so the default 80x30
- * minimum is close to square on screen, and the larger score is the split that leaves the
- * more usable panes.
+ * Cell height over cell width, for terminals that do not report pixel sizes. Common monospace
+ * fonts land between 1.8 and 2.2; Tern reports the real value through `tern inspect`.
  */
-function splitRoom(pane: PaneGeometry, horizontal: boolean, limits: PlacementLimits): number {
-	const cols = horizontal ? Math.floor((pane.cols - 1) / 2) : pane.cols;
-	const rows = horizontal ? pane.rows : Math.floor((pane.rows - 1) / 2);
-	return Math.min(cols / limits.cols, rows / limits.rows);
+const DEFAULT_CELL_ASPECT = 2;
+
+/** Height over width of one cell, from a pane's pixel and cell sizes; undefined if unusable. */
+function cellAspect(cols: number, rows: number, width: number, height: number): number | undefined {
+	const aspect = height / rows / (width / cols);
+	return Number.isFinite(aspect) && aspect > 0 ? aspect : undefined;
 }
 
 interface SplitOption {
 	pane: string;
 	direction: Direction;
-	room: number;
+	/** Both halves meet the minimum size; one cell goes to the divider. */
+	fits: boolean;
+	/** Shorter on-screen side of the smaller half, in cell widths. */
+	shortSide: number;
 }
 
-/** Highest room wins; ties keep the earlier option, so side by side beats stacked. */
+function splitOption(
+	pane: PaneGeometry,
+	direction: Direction,
+	limits: PlacementLimits,
+	aspect: number,
+): SplitOption {
+	const horizontal = direction === "left" || direction === "right";
+	const cols = horizontal ? Math.floor((pane.cols - 1) / 2) : pane.cols;
+	const rows = horizontal ? pane.rows : Math.floor((pane.rows - 1) / 2);
+	return {
+		pane: pane.id,
+		direction,
+		fits: cols >= limits.cols && rows >= limits.rows,
+		shortSide: Math.min(cols, rows * aspect),
+	};
+}
+
+/** Longest short side wins; ties keep the earlier option, so side by side beats stacked. */
 function roomiest(options: SplitOption[]): SplitOption | undefined {
 	let best: SplitOption | undefined;
-	for (const option of options) if (!best || option.room > best.room) best = option;
+	for (const option of options) if (!best || option.shortSide > best.shortSide) best = option;
 	return best;
 }
 
 /**
- * Geometry-aware placement. The fork stays in the source pane whenever either axis fits, and
- * that pane splits along whichever axis leaves the roomier halves. Only a source too small for
- * any split hands the fork to another pane: the best-scoring fit, largest pane on ties. An
- * explicit direction restricts every search to that direction. Without a fit, automatic
- * placement opens a tab and a forced split divides the source along its roomier axis anyway.
+ * Geometry-aware placement. Fit is measured in cells against the minimum; preference is
+ * measured on screen. The fork stays in the source pane whenever any allowed direction fits,
+ * splitting it so the smaller half keeps the longest short side, which cuts across the pane's
+ * longer on-screen edge. Only a source too small for any split hands the fork to another pane:
+ * the fitting option with the longest short side, largest pane on ties. An explicit direction
+ * restricts every search to that direction. Without a fit, automatic placement opens a tab and
+ * a forced split divides the source along its better axis anyway. `aspect` is cell height over
+ * cell width.
  */
 function planPlacement(
 	request: Pick<SideRequest, "placement" | "direction">,
 	sourceId: string,
 	panes: PaneGeometry[],
 	limits: PlacementLimits,
+	aspect: number,
 ): PlacementPlan {
 	if (request.placement === "tab") return { placement: "tab" };
 	const directions: Direction[] = request.direction ? [request.direction] : ["right", "down"];
 	const options = (pane: PaneGeometry): SplitOption[] =>
-		directions.map((direction) => ({
-			pane: pane.id,
-			direction,
-			room: splitRoom(pane, direction === "left" || direction === "right", limits),
-		}));
+		directions.map((direction) => splitOption(pane, direction, limits, aspect));
 	const source = panes.find((pane) => pane.id === sourceId);
-	const sourceBest = source ? roomiest(options(source)) : undefined;
+	const sourceOptions = source ? options(source) : [];
 	const chosen =
-		sourceBest && sourceBest.room >= 1
-			? sourceBest
-			: roomiest(
-					panes
-						.filter((pane) => pane.id !== sourceId)
-						.sort((a, b) => b.cols * b.rows - a.cols * a.rows)
-						.flatMap(options)
-						.filter((option) => option.room >= 1),
-				);
+		roomiest(sourceOptions.filter((option) => option.fits)) ??
+		roomiest(
+			panes
+				.filter((pane) => pane.id !== sourceId)
+				.sort((a, b) => b.cols * b.rows - a.cols * a.rows)
+				.flatMap(options)
+				.filter((option) => option.fits),
+		);
 	if (chosen) return { placement: "split", pane: chosen.pane, direction: chosen.direction };
 	if (request.placement === "split") {
-		return { placement: "split", pane: sourceId, direction: sourceBest?.direction ?? directions[0] };
+		return { placement: "split", pane: sourceId, direction: roomiest(sourceOptions)?.direction ?? directions[0] };
 	}
 	return { placement: "tab" };
 }
@@ -693,7 +710,7 @@ async function launchTmux(
 		if (!sourcePane && active === "1") sourcePane = id;
 	}
 	if (!sourcePane) throw new Error("tmux list-panes returned no active pane");
-	const plan = planPlacement(request, sourcePane, panes, placementLimits(env));
+	const plan = planPlacement(request, sourcePane, panes, placementLimits(env), DEFAULT_CELL_ASPECT);
 	const command = argv.map(shQuote).join(" ");
 	const args =
 		plan.placement === "tab"
@@ -744,6 +761,15 @@ interface TernSession {
 	tabs?: TernTab[];
 }
 
+/** A pane as a window draws it; `width` and `height` are its pixel size. */
+interface TernPane {
+	pane: number;
+	cols: number;
+	rows: number;
+	width: number;
+	height: number;
+}
+
 function resolveTern(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
 	const onPath = resolveOnPath(["tern"], env.PATH);
 	if (onPath !== "tern" || platform !== "darwin") return onPath;
@@ -761,7 +787,8 @@ function ternBlockId(output: string): number {
  * Tern's CLI leaves focus where it is for both `split` and `new tab`, so `--bg` needs no
  * restore step and a focused fork is one explicit `tern focus`. `split` only goes right or
  * down; left and up are a right/down split followed by `move`. Picture-in-picture panes float
- * over the layout, so they are neither split candidates nor counted against it.
+ * over the layout, so they are neither split candidates nor counted against it. The source
+ * pane's pixel size gives the real cell shape for comparing split directions.
  */
 async function launchTern(
 	run: Runner,
@@ -775,7 +802,10 @@ async function launchTern(
 	const sourcePane = Number.parseInt(env.TERN_PANE ?? "", 10);
 	if (!Number.isFinite(sourcePane)) throw new Error("TERN_PANE is invalid");
 	const tern = resolveTern(env, platform);
-	const tree = JSON.parse(await checked(run, tern, ["inspect", "--json"])) as { sessions?: TernSession[] };
+	const tree = JSON.parse(await checked(run, tern, ["inspect", "--json"])) as {
+		sessions?: TernSession[];
+		panes?: TernPane[];
+	};
 	let session: TernSession | undefined;
 	let tab: TernTab | undefined;
 	for (const candidate of tree.sessions ?? []) {
@@ -789,7 +819,10 @@ async function launchTern(
 	const tiled: PaneGeometry[] = (tab.blocks ?? [])
 		.filter((block) => block.pip == null && typeof block.cols === "number" && typeof block.rows === "number")
 		.map((block) => ({ id: String(block.id), cols: block.cols as number, rows: block.rows as number }));
-	const plan = planPlacement(request, String(sourcePane), tiled, placementLimits(env));
+	const pixels = tree.panes?.find((pane) => pane.pane === sourcePane);
+	const aspect =
+		(pixels && cellAspect(pixels.cols, pixels.rows, pixels.width, pixels.height)) ?? DEFAULT_CELL_ASPECT;
+	const plan = planPlacement(request, String(sourcePane), tiled, placementLimits(env), aspect);
 	const launch = ["--json", "--cwd", cwd, "--", ...argv];
 	let target: number;
 	if (plan.placement === "tab") {
@@ -827,7 +860,7 @@ async function launchWezTerm(
 	const tabPanes: PaneGeometry[] = panes
 		.filter((pane) => pane.tab_id === source.tab_id && pane.size)
 		.map((pane) => ({ id: String(pane.pane_id), cols: pane.size?.cols ?? 0, rows: pane.size?.rows ?? 0 }));
-	const plan = planPlacement(request, String(sourcePane), tabPanes, placementLimits(env));
+	const plan = planPlacement(request, String(sourcePane), tabPanes, placementLimits(env), DEFAULT_CELL_ASPECT);
 	const args =
 		plan.placement === "tab"
 			? ["cli", "spawn", "--pane-id", String(sourcePane), "--cwd", cwd, "--", ...argv]
