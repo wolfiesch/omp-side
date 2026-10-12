@@ -44,7 +44,8 @@ omp plugin install github:wolfiesch/omp-side
 
 Restart omp. Extensions load at startup, so the session you are in when you install will not have `/side` yet.
 
-Prefer a plain file? Clone anywhere and symlink the single module instead:
+Prefer a checkout? Clone the repository and symlink its entry module instead. Keep
+`side-management.ts` alongside `index.ts` in the checkout:
 
 ```sh
 git clone https://github.com/wolfiesch/omp-side.git
@@ -62,6 +63,9 @@ Use one method or the other. Both at once registers the command twice.
 /side --split -- <prompt>               force a split even when no pane has room
 /side --down -- <prompt>                split below only
 /side --pull -- <prompt>                deliver the fork's first answer back here
+/side list                              list this session's forks and pane status
+/side focus 2                           switch to fork 2
+/side close 2                           confirm closing fork 2; keep its transcript
 /side --model @slow --thinking high -- <prompt>
                                          fork with a different model and reasoning level
 ```
@@ -75,8 +79,9 @@ Use one method or the other. Both at once registers the command twice.
 | `--pull` | Watch the fork and attach its first answer to your next message here. |
 | anything else | Passed through to `omp`, so `--model`, `--thinking`, `--tools`, and friends all work. |
 
-`--` separates flags from the prompt. Without it the whole argument string is the prompt, unless it
-starts with `-`, in which case it is all flags and the fork opens empty.
+Use `--` to separate flags from the prompt. Without it, a leading `list`, `focus`, or `close`
+selects a management command; a leading `-` means flags only; anything else is the prompt.
+For a prompt starting with a reserved word, write `/side -- list the possible causes`.
 
 `alt+s` is bound to an empty focused fork using automatic placement.
 
@@ -85,31 +90,57 @@ role aliases such as `@smol` and `@slow`; `--thinking` offers the supported CLI 
 Choose `--` when you are ready to type the prompt. Earlier options remain intact as each completion
 is accepted, so the whole launch can be built without memorizing flag values.
 
+### Managing forks
+
+Use `/side list` to see stable fork numbers, prompts, terminal names, and pane status. Numbers
+remain assigned after a pane closes and across parent-session restarts. A child session starts
+its own fork list rather than inheriting control of its parent's other forks.
+
+Use `/side focus N` to switch to a live fork. Use `/side close N` to close its pane after a
+confirmation. Closing terminates any running process in that pane; the transcript remains on
+disk. Terminal identity and live pane state are checked again after confirmation.
+
+Management is available in tmux, Tern, WezTerm, Kitty, and cmux. In tmux, Tern, and Kitty, the
+launch or process arguments must still name the recorded child session. WezTerm and cmux do not
+expose that check through these adapters, so validation uses the terminal scope and exact pane
+identity. Direct Ghostty windows cannot be focused or closed through `/side`.
+
+Older forks without recorded child identity appear as `unverified` and cannot be focused or
+closed. Missing panes appear as `gone`; inaccessible terminals appear as `unavailable`. Neither
+case causes a command to target the current pane instead.
+
 ### Automatic placement
 
 In tmux, Tern, and WezTerm, `/side` reads each pane's size and splits only where both halves stay at
 least 80 columns wide and 30 rows tall.
 
-1. **Your pane first.** When your pane can split either way, the fork opens next to you. The split
-   cuts across the pane's longer side on screen, so each half keeps the most room in its shorter
-   dimension: a wide pane goes side by side and a tall pane stacks. Ties go side by side.
-2. **Another pane only when yours is too small.** The fork goes to whichever pane and direction
-   leaves the most room by the same measure, preferring the largest pane on ties.
-3. **A new tab** when nothing fits.
+1. **Keep repeat forks together.** If an automatically placed fork from this parent is still
+   in the same tab, stack the next fork below a member of that group. The parent pane stays
+   unchanged. When no group member has room for another stacked split, use a new tab.
+2. **Otherwise, your pane first.** Split along whichever permitted axis leaves the roomier
+   halves on screen. Wide panes go side by side, tall panes stack, and ties go side by side.
+3. **Another pane only when yours is too small.** In tmux, prefer a fitting pane that shares an
+   edge with yours before considering more distant panes. Within either group, choose the
+   roomiest split, preferring the largest pane on ties. Corner-only contact is not adjacency.
+4. **A new tab** when nothing fits.
 
-An explicit direction keeps the same order but searches only that direction. `--split` without a
-fit divides your pane along its better axis.
+Only live tiled panes in the current tab qualify for grouping; closed and moved-away panes do
+not. The first split remains size-aware, so a tall parent can begin a group below itself rather
+than to its right. Grouping applies to automatic forks recorded from version 0.5.0 onward.
+
+Explicit `--tab`, `--split`, and direction flags bypass grouping. Direction flags restrict the
+search to that direction. `--split` without a fit divides your pane along its better axis.
 
 Screen shape depends on the font: a cell is roughly twice as tall as it is wide, and the exact
 ratio varies by font and size. Tern reports each pane's pixel size, so `/side` uses your actual
 cell shape there. tmux and WezTerm placement assumes a 2:1 cell.
 
-Existing panes are never resized. Tern picture-in-picture panes float over the layout, so they are
-neither split nor counted. Set `OMP_SIDE_MIN_COLS` and `OMP_SIDE_MIN_ROWS` to change the minimum;
+Only the pane selected for a split is divided; unrelated panes are not rearranged. Tern
+picture-in-picture panes are excluded. Set `OMP_SIDE_MIN_COLS` and `OMP_SIDE_MIN_ROWS` to change the minimum;
 a value that is not a positive whole number fails the command with the variable's name.
 
-cmux and Kitty do not report pane sizes through their CLIs, so they keep a simpler rule: a one-pane
-tab gets one split, and an already split tab gets a new tab.
+The cmux and Kitty adapters retain the simpler pane-count rule: a one-pane tab gets one split,
+and an already split tab gets a new tab. Repeat-fork grouping is available in tmux, Tern, and WezTerm.
 
 ## What `--pull` does
 
@@ -147,15 +178,18 @@ Unsupported terminals fail visibly instead of typing a command into an unknown U
    selects a split target and direction, or a tab.
 4. The extension forks the transcript into a new session file, recording `parentSession` and
    `providerPromptCacheKey` pointing at the parent.
-5. It appends an empty todo snapshot and a hidden tangent boundary to the child.
+5. It pairs unresolved tool calls at the copied turn's tail with explicit unknown-outcome error
+   results, then appends an empty todo snapshot and a hidden tangent boundary. Completed results
+   and the parent's transcript remain unchanged.
 6. The adapter starts `omp --cwd <cwd> --resume <child-session.jsonl> [your flags] [your prompt]`.
 
 Every argument stays separate for Tern, WezTerm, Kitty, and Ghostty. cmux and tmux require one POSIX
 shell command string, so each argument is single-quoted independently before launch.
 
 A spawn is recorded in the parent transcript as a custom entry of type `omp-side.spawn`, including
-the selected terminal, placement, and target. The branch point stays visible in session history and
-HTML exports.
+the selected terminal, placement, target, child session file, and terminal routing identity.
+Management and repeat-fork grouping use these entries. Confirmed closes are recorded as
+`omp-side.closed`; transcripts are never deleted by a close command.
 
 The boundary is re-injected after child-session compaction. Parent todos therefore remain context,
 not child obligations, and an incomplete-todo reminder cannot resume the parent's work.
@@ -167,9 +201,9 @@ not child obligations, and an incomplete-todo reminder cannot resume the parent'
   long conversation, and consider `--model @smol` for cheap tangents.
 - **Startup takes ten to fifteen seconds**, almost all of it MCP servers reconnecting in the new
   process. There is currently no way to start an omp session with MCP disabled.
-- **Forking mid-turn leaves a scar.** If the main agent is running when you type `/side`, the
-  transcript tail contains an unfinished tool call, and the fork opens with a warning that the
-  previous session ended with a pending call. Harmless, and it goes away if you fork while idle.
+- **Mid-turn forks are snapshots.** Pending tool calls at the fork boundary receive explicit
+  unknown-outcome error results in the child. The parent may still finish those tools, but its
+  later results do not automatically appear in the fork.
 - **A brand new session has nothing to fork.** Until a session writes its first entries to disk it
   has no file, and `/side` will say so instead of silently opening an unrelated blank session.
 - **The last moments of an in-flight turn may not be on disk.** Extensions cannot force a session

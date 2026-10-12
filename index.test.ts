@@ -129,6 +129,9 @@ describe("tangent isolation", () => {
 						messages.push(message);
 						return "message";
 					},
+					getBranch() {
+						return [];
+					},
 					getSessionFile() {
 						return "/sessions/child.jsonl";
 					},

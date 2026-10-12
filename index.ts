@@ -17,8 +17,13 @@ import { open, readdir, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { basename, delimiter, dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import {
+	checked, collectForks, detectTerminal, manageForks, parseManagementCommand,
+	resolveOnPath, resolveTern, terminalScope, terminalSource, tokenize,
+	SPAWN_ENTRY_TYPE as SPAWN_ENTRY, CLOSED_ENTRY_TYPE,
+} from "./side-management";
+import type { Runner, TerminalKind } from "./side-management";
 
-const SPAWN_ENTRY = "omp-side.spawn";
 const SIDE_CONTEXT_ENTRY = "omp-side.context";
 const USER_TODO_EDIT_ENTRY = "user_todo_edit";
 const SIDE_CONTEXT_SWITCH = `<system-notice cause="fork">
@@ -38,8 +43,6 @@ const TERMINAL_TIMEOUT_MS = 15_000;
 
 type Direction = "right" | "left" | "up" | "down";
 type Placement = "auto" | "split" | "tab";
-type TerminalKind = "cmux" | "tmux" | "tern" | "wezterm" | "kitty" | "ghostty";
-const TERN_APP_BINARY = "/Applications/Tern.app/Contents/MacOS/tern";
 
 interface SideRequest {
 	focus: boolean;
@@ -47,6 +50,8 @@ interface SideRequest {
 	pull: boolean;
 	/** Set only by an explicit direction flag; automatic placement may choose either axis. */
 	direction?: Direction;
+	/** Recorded live fork candidates, validated against the current terminal tab before use. */
+	sidePanes?: readonly string[];
 	ompArgs: string[];
 	prompt: string;
 }
@@ -76,6 +81,12 @@ const SIDE_FLAG_COMPLETIONS: readonly CompletionItem[] = [
 	{ value: "--model", label: "--model", description: "Choose the side session model" },
 	{ value: "--thinking", label: "--thinking", description: "Choose the reasoning level" },
 	{ value: "--", label: "--", description: "Finish options and start the prompt" },
+];
+
+const SIDE_COMMAND_COMPLETIONS: readonly CompletionItem[] = [
+	{ value: "list", label: "list", description: "List this session's forks and their pane status" },
+	{ value: "focus", label: "focus <n>", description: "Focus a numbered fork" },
+	{ value: "close", label: "close <n>", description: "Close a fork after confirmation; keep its transcript" },
 ];
 
 const THINKING_LEVEL_COMPLETIONS: readonly CompletionItem[] = [
@@ -114,6 +125,12 @@ function getSideArgumentCompletions(
 	const query = tokenMatch[2] ?? "";
 	const priorTokens = head.trim().split(/\s+/).filter(Boolean);
 	const previous = priorTokens.at(-1);
+	if (["list", "focus", "close"].includes(priorTokens[0])) return null;
+	if (priorTokens.length === 0 && (!query || !query.startsWith("-"))) {
+		const commands = completeValues(head, query, SIDE_COMMAND_COMPLETIONS);
+		if (query) return commands;
+		return [...(commands ?? []), ...(completeValues(head, query, SIDE_FLAG_COMPLETIONS) ?? [])];
+	}
 
 	if (previous === "--model") {
 		const normalized = query.toLowerCase();
@@ -179,49 +196,6 @@ function shQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-/** Quote-aware whitespace split, used only for the flag section before `--`. */
-function tokenize(input: string): string[] {
-	const out: string[] = [];
-	let current = "";
-	let quote: '"' | "'" | null = null;
-	let quoted = false;
-	for (let index = 0; index < input.length; index++) {
-		const ch = input[index];
-		if (quote) {
-			if (ch === quote) {
-				quote = null;
-			} else if (quote === '"' && ch === "\\") {
-				if (index + 1 >= input.length) throw new Error("trailing escape in /side flags");
-				current += input[++index];
-			} else {
-				current += ch;
-			}
-			continue;
-		}
-		if (ch === '"' || ch === "'") {
-			quote = ch;
-			quoted = true;
-			continue;
-		}
-		if (ch === "\\") {
-			if (index + 1 >= input.length) throw new Error("trailing escape in /side flags");
-			current += input[++index];
-			continue;
-		}
-		if (/\s/.test(ch)) {
-			if (current || quoted) {
-				out.push(current);
-				current = "";
-				quoted = false;
-			}
-			continue;
-		}
-		current += ch;
-	}
-	if (quote) throw new Error("unterminated quote in /side flags");
-	if (current || quoted) out.push(current);
-	return out;
-}
 
 function parseRequest(raw: string): SideRequest {
 	const request: SideRequest = {
@@ -343,9 +317,70 @@ function buildChildArgv(
 
 type SideSessionManager = Pick<
 	ExtensionContext["sessionManager"],
-	"appendCustomEntry" | "appendMessage" | "getSessionFile" | "close"
+	"appendCustomEntry" | "appendMessage" | "getBranch" | "getSessionFile" | "close"
 >;
 type ForkFactory = (sourcePath: string, cwd: string, sessionDir?: string) => Promise<SideSessionManager>;
+
+const FORK_PENDING_TOOL_RESULT =
+	"This tool call had no recorded result when the side session was forked from its parent. It was not run by the side session, and its outcome is unknown.";
+
+interface PendingToolCall {
+	id: string;
+	name: string;
+}
+
+/**
+ * Calls on the copied branch's trailing assistant turn that have no tool result yet.
+ *
+ * Only the tail turn qualifies: its results are appended directly after it. Earlier
+ * unresolved calls sit under later messages, where a result appended at the leaf would be
+ * out of order, and OMP already strips those when it builds model context. Results that
+ * already exist (a partly finished batch) are never repeated.
+ */
+function findTailPendingToolCalls(manager: Pick<SideSessionManager, "getBranch">): PendingToolCall[] {
+	const branch = manager.getBranch();
+	const answered = new Set<string>();
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+		if (message.role === "toolResult") {
+			answered.add(message.toolCallId);
+			continue;
+		}
+		if (message.role !== "assistant" || !Array.isArray(message.content)) return [];
+		const pending: PendingToolCall[] = [];
+		const seen = new Set<string>();
+		for (const block of message.content) {
+			if (block.type !== "toolCall" || answered.has(block.id) || seen.has(block.id)) continue;
+			seen.add(block.id);
+			pending.push({ id: block.id, name: block.name });
+		}
+		return pending;
+	}
+	return [];
+}
+
+/**
+ * Pair the copied branch's unresolved tail calls with explicit error results.
+ *
+ * The parent may still be running those tools, so the child records an unknown outcome
+ * rather than a success. Only the child's own freshly created session file is appended to.
+ */
+function repairForkedToolCalls(manager: Pick<SideSessionManager, "appendMessage" | "getBranch">): number {
+	const pending = findTailPendingToolCalls(manager);
+	for (const call of pending) {
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: call.id,
+			toolName: call.name,
+			content: [{ type: "text", text: FORK_PENDING_TOOL_RESULT }],
+			isError: true,
+			timestamp: Date.now(),
+		});
+	}
+	return pending.length;
+}
 
 function seedTangentContext(
 	manager: Pick<SideSessionManager, "appendCustomEntry" | "appendMessage">,
@@ -369,6 +404,7 @@ async function prepareSideFork(
 ): Promise<string> {
 	const manager = await forkFrom(parentSessionFile, cwd, sessionDir);
 	try {
+		repairForkedToolCalls(manager);
 		seedTangentContext(manager, parentSessionFile);
 		const childSessionFile = manager.getSessionFile();
 		if (!childSessionFile) throw new Error("OMP created a side fork without a session file");
@@ -388,13 +424,6 @@ function isSideFork(ctx: ExtensionContext): boolean {
 		);
 }
 
-interface ExecOutput {
-	code: number;
-	stdout: string;
-	stderr: string;
-}
-
-type Runner = (command: string, args: string[]) => Promise<ExecOutput>;
 
 interface LaunchResult {
 	target: string;
@@ -406,30 +435,6 @@ function createRunner(pi: ExtensionAPI): Runner {
 	return (command, args) => pi.exec(command, args, { timeout: TERMINAL_TIMEOUT_MS });
 }
 
-async function checked(run: Runner, command: string, args: string[]): Promise<string> {
-	const result = await run(command, args);
-	if (result.code !== 0) {
-		const detail = (result.stderr || result.stdout).trim() || `exit ${result.code}`;
-		throw new Error(`${command} ${args[0] ?? ""}: ${detail}`.trim());
-	}
-	return result.stdout.trim();
-}
-
-function resolveOnPath(names: string[], path = process.env.PATH ?? ""): string {
-	for (const name of names) {
-		for (const dir of path.split(delimiter)) {
-			if (!dir) continue;
-			const candidate = join(dir, name);
-			try {
-				accessSync(candidate, constants.X_OK);
-				if (statSync(candidate).isFile()) return candidate;
-			} catch {
-				// keep looking
-			}
-		}
-	}
-	return names[0];
-}
 
 function pathWithExecutableDir(path: string | undefined, executable: string): string | undefined {
 	if (path === undefined) return undefined;
@@ -444,15 +449,6 @@ function commandWithRuntimePath(argv: string[], path: string | undefined, execut
 	return ["/usr/bin/env", `PATH=${childPath}`, ...argv];
 }
 
-function detectTerminal(env: NodeJS.ProcessEnv): TerminalKind | null {
-	if (env.CMUX_WORKSPACE_ID) return "cmux";
-	if (env.TMUX) return "tmux";
-	if (env.TERM_PROGRAM?.toLowerCase() === "tern" && env.TERN_PANE) return "tern";
-	if (env.WEZTERM_PANE) return "wezterm";
-	if (env.KITTY_WINDOW_ID) return "kitty";
-	if (env.TERM_PROGRAM?.toLowerCase() === "ghostty" || env.GHOSTTY_RESOURCES_DIR) return "ghostty";
-	return null;
-}
 
 function choosePlacement(requested: Placement, paneCount: number): "split" | "tab" {
 	if (requested === "tab") return "tab";
@@ -464,6 +460,8 @@ interface PaneGeometry {
 	id: string;
 	cols: number;
 	rows: number;
+	left?: number;
+	top?: number;
 }
 
 interface PlacementLimits {
@@ -538,15 +536,21 @@ function roomiest(options: SplitOption[]): SplitOption | undefined {
 	return best;
 }
 
+/** Panes share an edge with one divider cell between them; corner contact is not adjacent. */
+function panesTouch(a: PaneGeometry, b: PaneGeometry): boolean {
+	if (a.left === undefined || a.top === undefined || b.left === undefined || b.top === undefined) return false;
+	const verticalOverlap = Math.min(a.top + a.rows, b.top + b.rows) > Math.max(a.top, b.top);
+	const horizontalOverlap = Math.min(a.left + a.cols, b.left + b.cols) > Math.max(a.left, b.left);
+	return (
+		(verticalOverlap && (a.left + a.cols + 1 === b.left || b.left + b.cols + 1 === a.left)) ||
+		(horizontalOverlap && (a.top + a.rows + 1 === b.top || b.top + b.rows + 1 === a.top))
+	);
+}
+
 /**
- * Geometry-aware placement. Fit is measured in cells against the minimum; preference is
- * measured on screen. The fork stays in the source pane whenever any allowed direction fits,
- * splitting it so the smaller half keeps the longest short side, which cuts across the pane's
- * longer on-screen edge. Only a source too small for any split hands the fork to another pane:
- * the fitting option with the longest short side, largest pane on ties. An explicit direction
- * restricts every search to that direction. Without a fit, automatic placement opens a tab and
- * a forced split divides the source along its better axis anyway. `aspect` is cell height over
- * cell width.
+ * Automatic repeat forks stack in their existing group, leaving the parent alone. A full
+ * group opens a tab. Otherwise prefer the source, then fitting neighbors (where coordinates
+ * exist), then other fitting panes. Explicit placement bypasses grouping.
  */
 function planPlacement(
 	request: Pick<SideRequest, "placement" | "direction">,
@@ -554,22 +558,33 @@ function planPlacement(
 	panes: PaneGeometry[],
 	limits: PlacementLimits,
 	aspect: number,
+	sidePanes: readonly string[] = [],
 ): PlacementPlan {
 	if (request.placement === "tab") return { placement: "tab" };
+	if (request.placement === "auto" && !request.direction && sidePanes.length > 0) {
+		const group = panes
+			.filter(pane => pane.id !== sourceId && sidePanes.includes(pane.id))
+			.sort((a, b) => b.cols * b.rows - a.cols * a.rows);
+		if (group.length > 0) {
+			const stacked = roomiest(group.map(pane => splitOption(pane, "down", limits, aspect)).filter(option => option.fits));
+			return stacked
+				? { placement: "split", pane: stacked.pane, direction: "down" }
+				: { placement: "tab" };
+		}
+	}
 	const directions: Direction[] = request.direction ? [request.direction] : ["right", "down"];
 	const options = (pane: PaneGeometry): SplitOption[] =>
 		directions.map((direction) => splitOption(pane, direction, limits, aspect));
 	const source = panes.find((pane) => pane.id === sourceId);
 	const sourceOptions = source ? options(source) : [];
+	const others = panes
+		.filter(pane => pane.id !== sourceId)
+		.sort((a, b) => b.cols * b.rows - a.cols * a.rows);
+	const neighboring = source ? others.filter(pane => panesTouch(source, pane)) : [];
 	const chosen =
-		roomiest(sourceOptions.filter((option) => option.fits)) ??
-		roomiest(
-			panes
-				.filter((pane) => pane.id !== sourceId)
-				.sort((a, b) => b.cols * b.rows - a.cols * a.rows)
-				.flatMap(options)
-				.filter((option) => option.fits),
-		);
+		roomiest(sourceOptions.filter(option => option.fits)) ??
+		roomiest(neighboring.flatMap(options).filter(option => option.fits)) ??
+		roomiest(others.flatMap(options).filter(option => option.fits));
 	if (chosen) return { placement: "split", pane: chosen.pane, direction: chosen.direction };
 	if (request.placement === "split") {
 		return { placement: "split", pane: sourceId, direction: roomiest(sourceOptions)?.direction ?? directions[0] };
@@ -695,14 +710,18 @@ async function launchTmux(
 		"list-panes",
 		...(env.TMUX_PANE ? ["-t", env.TMUX_PANE] : []),
 		"-F",
-		"#{pane_id} #{pane_width} #{pane_height} #{pane_active}",
+		"#{pane_id} #{pane_width} #{pane_height} #{pane_active} #{pane_left} #{pane_top} #{pane_dead}",
 	]);
 	let sourcePane = env.TMUX_PANE;
 	const panes: PaneGeometry[] = [];
 	for (const line of listing.split("\n")) {
-		const [id, cols, rows, active] = line.trim().split(" ");
-		if (!id) continue;
-		const geometry = { id, cols: Number(cols), rows: Number(rows) };
+		const [id, cols, rows, active, left, top, dead] = line.trim().split(/\s+/);
+		if (!id || dead === "1") continue;
+		const geometry = {
+			id, cols: Number(cols), rows: Number(rows),
+			left: left === undefined ? undefined : Number(left),
+			top: top === undefined ? undefined : Number(top),
+		};
 		if (!Number.isFinite(geometry.cols) || !Number.isFinite(geometry.rows)) {
 			throw new Error(`unexpected tmux list-panes line: ${line}`);
 		}
@@ -710,7 +729,7 @@ async function launchTmux(
 		if (!sourcePane && active === "1") sourcePane = id;
 	}
 	if (!sourcePane) throw new Error("tmux list-panes returned no active pane");
-	const plan = planPlacement(request, sourcePane, panes, placementLimits(env), DEFAULT_CELL_ASPECT);
+	const plan = planPlacement(request, sourcePane, panes, placementLimits(env), DEFAULT_CELL_ASPECT, request.sidePanes);
 	const command = argv.map(shQuote).join(" ");
 	const args =
 		plan.placement === "tab"
@@ -748,6 +767,8 @@ interface TernBlock {
 	id: number;
 	cols?: number;
 	rows?: number;
+	live?: boolean;
+	exited?: unknown;
 	/** Set on picture-in-picture panes, which float over the tiled layout. */
 	pip?: unknown;
 }
@@ -770,11 +791,6 @@ interface TernPane {
 	height: number;
 }
 
-function resolveTern(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
-	const onPath = resolveOnPath(["tern"], env.PATH);
-	if (onPath !== "tern" || platform !== "darwin") return onPath;
-	return existsSync(TERN_APP_BINARY) ? TERN_APP_BINARY : onPath;
-}
 
 function ternBlockId(output: string): number {
 	const parsed: unknown = JSON.parse(output);
@@ -817,12 +833,18 @@ async function launchTern(
 	}
 	if (!session || !tab) throw new Error(`Tern block ${sourcePane} was not returned by tern inspect`);
 	const tiled: PaneGeometry[] = (tab.blocks ?? [])
-		.filter((block) => block.pip == null && typeof block.cols === "number" && typeof block.rows === "number")
+		.filter((block) =>
+			block.pip == null && block.live !== false && block.exited == null &&
+			typeof block.cols === "number" && typeof block.rows === "number",
+		)
 		.map((block) => ({ id: String(block.id), cols: block.cols as number, rows: block.rows as number }));
 	const pixels = tree.panes?.find((pane) => pane.pane === sourcePane);
 	const aspect =
 		(pixels && cellAspect(pixels.cols, pixels.rows, pixels.width, pixels.height)) ?? DEFAULT_CELL_ASPECT;
-	const plan = planPlacement(request, String(sourcePane), tiled, placementLimits(env), aspect);
+	const plan = planPlacement(
+		request, String(sourcePane), tiled, placementLimits(env), aspect,
+		request.sidePanes?.map(target => target.replace(/^block:/, "")),
+	);
 	const launch = ["--json", "--cwd", cwd, "--", ...argv];
 	let target: number;
 	if (plan.placement === "tab") {
@@ -860,7 +882,7 @@ async function launchWezTerm(
 	const tabPanes: PaneGeometry[] = panes
 		.filter((pane) => pane.tab_id === source.tab_id && pane.size)
 		.map((pane) => ({ id: String(pane.pane_id), cols: pane.size?.cols ?? 0, rows: pane.size?.rows ?? 0 }));
-	const plan = planPlacement(request, String(sourcePane), tabPanes, placementLimits(env), DEFAULT_CELL_ASPECT);
+	const plan = planPlacement(request, String(sourcePane), tabPanes, placementLimits(env), DEFAULT_CELL_ASPECT, request.sidePanes);
 	const args =
 		plan.placement === "tab"
 			? ["cli", "spawn", "--pane-id", String(sourcePane), "--cwd", cwd, "--", ...argv]
@@ -1170,6 +1192,18 @@ async function openSide(pi: ExtensionAPI, ctx: ExtensionCommandContext, request:
 	if (typeof managerClass.forkFrom !== "function") {
 		throw new Error("this OMP build does not expose session forking to extensions");
 	}
+	const terminal = detectTerminal(process.env);
+	if (!terminal) throw new Error("unsupported terminal for /side");
+	const scope = terminalScope(terminal, process.env);
+	const source = terminalSource(terminal, process.env);
+	const forks = collectForks(ctx.sessionManager.getEntries(), sessionFile);
+	const sidePanes = forks
+		.filter(fork =>
+			!fork.closed && fork.data.automatic === true && fork.data.placement === "split" &&
+			fork.data.terminal === terminal && fork.data.scope === scope &&
+			source !== undefined && fork.data.source === source,
+		)
+		.map(fork => fork.data.target);
 	const childSessionFile = await prepareSideFork(
 		sessionFile,
 		cwd,
@@ -1187,7 +1221,7 @@ async function openSide(pi: ExtensionAPI, ctx: ExtensionCommandContext, request:
 		createRunner(pi),
 		process.env,
 		process.platform,
-		request,
+		{ ...request, sidePanes },
 		cwd,
 		argv,
 		paneTitle(request.prompt),
@@ -1195,6 +1229,10 @@ async function openSide(pi: ExtensionAPI, ctx: ExtensionCommandContext, request:
 
 	pi.appendEntry(SPAWN_ENTRY, {
 		parentSessionFile: sessionFile,
+		childSessionFile,
+		scope,
+		source,
+		automatic: request.placement === "auto" && !request.direction,
 		target: launched.target,
 		terminal: launched.terminal,
 		placement: launched.placement,
@@ -1204,7 +1242,7 @@ async function openSide(pi: ExtensionAPI, ctx: ExtensionCommandContext, request:
 		at: new Date().toISOString(),
 	});
 	ctx.ui.notify(
-		`side session forked into ${launched.terminal} ${launched.placement} ${launched.target}${
+		`side session #${forks.length + 1} forked into ${launched.terminal} ${launched.placement} ${launched.target}${
 			request.pull ? " — its first answer will come back to me" : ""
 		}`,
 		"info",
@@ -1234,11 +1272,25 @@ export default function ompSide(pi: ExtensionAPI) {
 		if (event.result && !event.aborted) reinjectSideContext(pi, ctx);
 	});
 	pi.registerCommand("side", {
-		description: "Fork this session beside you: /side [--model X --thinking LEVEL --] <prompt>",
+		description: "Fork nearby, or manage forks with /side list, /side focus <n>, /side close <n>",
 		getArgumentCompletions: argumentPrefix => getSideArgumentCompletions(argumentPrefix, completionModels),
 		handler: async (args, ctx) => {
 			try {
-				await openSide(pi, ctx, parseRequest(args));
+				const command = parseManagementCommand(args);
+				if (command) {
+					const sessionFile = ctx.sessionManager.getSessionFile();
+					if (!sessionFile) throw new Error("/side management needs a persisted session");
+					await manageForks(command, collectForks(ctx.sessionManager.getEntries(), sessionFile), {
+						run: createRunner(pi),
+						env: process.env,
+						platform: process.platform,
+						confirm: (title, message) => ctx.ui.confirm(title, message),
+						notify: (message, level) => ctx.ui.notify(message, level),
+						recordClose: spawnEntryId => pi.appendEntry(CLOSED_ENTRY_TYPE, { parentSessionFile: sessionFile, spawnEntryId }),
+					});
+				} else {
+					await openSide(pi, ctx, parseRequest(args));
+				}
 			} catch (error) {
 				ctx.ui.notify(`/side failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 			}
