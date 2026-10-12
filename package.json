@@ -1,6 +1,6 @@
 {
 	"name": "omp-side",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"description": "Fork the current Oh My Pi session into a nearby terminal pane or tab with /side",
 	"license": "MIT",
 	"repository": {
@@ -25,7 +25,7 @@
 		"subagent",
 		"terminal-multiplexer"
 	],
-	"files": ["index.ts", "README.md", "LICENSE"],
+	"files": ["index.ts", "side-management.ts", "README.md", "LICENSE"],
 	"omp": {
 		"extensions": ["./index.ts"]
 	}
