@@ -227,10 +227,22 @@ describe("automatic placement", () => {
 	test.each([
 		["one wide pane splits beside itself", auto, [pane("s", 288, 85)], { placement: "split", pane: "s", direction: "right" }],
 		[
-			"a narrow source splits the largest pane that fits side by side",
+			"a narrow but tall source stacks in place instead of moving to a wider pane",
 			auto,
-			[pane("s", 107, 93), pane("big", 208, 93), pane("mid", 170, 93)],
-			{ placement: "split", pane: "big", direction: "right" },
+			[pane("s", 107, 93), pane("big", 208, 93)],
+			{ placement: "split", pane: "s", direction: "down" },
+		],
+		[
+			"a tall source that fits both ways splits along its roomier axis",
+			auto,
+			[pane("s", 211, 117)],
+			{ placement: "split", pane: "s", direction: "down" },
+		],
+		[
+			"a source too small for any split hands off to the roomiest other pane",
+			auto,
+			[pane("s", 107, 50), pane("mid", 170, 93), pane("big", 208, 120)],
+			{ placement: "split", pane: "big", direction: "down" },
 		],
 		[
 			"two full columns stack below the source before trying other panes",
@@ -264,10 +276,16 @@ describe("automatic placement", () => {
 			{ placement: "split", pane: "s", direction: "left" },
 		],
 		[
-			"--split without a fit divides the source to the right",
+			"--split without a fit divides the source along its roomier axis",
 			{ placement: "split" as const },
 			[pane("s", 120, 40)],
 			{ placement: "split", pane: "s", direction: "right" },
+		],
+		[
+			"--split without a fit stacks a tall source",
+			{ placement: "split" as const },
+			[pane("s", 100, 59)],
+			{ placement: "split", pane: "s", direction: "down" },
 		],
 		["--tab wins over available space", { placement: "tab" as const }, [pane("s", 288, 85)], { placement: "tab" }],
 	])("%s", (_name, request, panes, expected) => {
@@ -514,10 +532,10 @@ describe("terminal launch adapters", () => {
 		]);
 	});
 
-	test("Tern splits a wide sibling when the source is too narrow and ignores picture-in-picture panes", async () => {
+	test("Tern splits a wide sibling when the source is too small and ignores picture-in-picture panes", async () => {
 		const fake = runner((_command, args) =>
 			args[0] === "inspect"
-				? { stdout: ternTree([[41, 107, 93], [43, 208, 93], [45, 300, 90, { owner: 43, corner: "br" }]]) }
+				? { stdout: ternTree([[41, 107, 50], [43, 208, 93], [45, 300, 90, { owner: 43, corner: "br" }]]) }
 				: args[0] === "split"
 					? { stdout: JSON.stringify({ session: 40, tab: 50, block: 46 }) }
 					: {},
@@ -534,7 +552,7 @@ describe("terminal launch adapters", () => {
 
 		expect(result).toEqual({ target: "block:46", terminal: "tern", placement: "split" });
 		expect(fake.calls.slice(1).map((call) => call.args)).toEqual([
-			["split", "43", "right", "--json", "--cwd", "/tmp/a b", "--", ...argv],
+			["split", "43", "down", "--json", "--cwd", "/tmp/a b", "--", ...argv],
 		]);
 	});
 

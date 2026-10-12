@@ -493,18 +493,39 @@ function placementLimits(env: NodeJS.ProcessEnv): PlacementLimits {
 	};
 }
 
-/** Both halves of a split must meet the minimum; one cell goes to the divider. */
-function splitFits(pane: PaneGeometry, horizontal: boolean, limits: PlacementLimits): boolean {
-	return horizontal
-		? Math.floor((pane.cols - 1) / 2) >= limits.cols && pane.rows >= limits.rows
-		: Math.floor((pane.rows - 1) / 2) >= limits.rows && pane.cols >= limits.cols;
+/**
+ * Room left in the tighter half of a split, in units of the minimum pane: the smaller of
+ * half-width over minimum columns and half-height over minimum rows, with one cell for the
+ * divider. Both halves fit when it is at least 1. Scaling by the minimum keeps the comparison
+ * honest about cell shape: a cell is about twice as tall as it is wide, so the default 80x30
+ * minimum is close to square on screen, and the larger score is the split that leaves the
+ * more usable panes.
+ */
+function splitRoom(pane: PaneGeometry, horizontal: boolean, limits: PlacementLimits): number {
+	const cols = horizontal ? Math.floor((pane.cols - 1) / 2) : pane.cols;
+	const rows = horizontal ? pane.rows : Math.floor((pane.rows - 1) / 2);
+	return Math.min(cols / limits.cols, rows / limits.rows);
+}
+
+interface SplitOption {
+	pane: string;
+	direction: Direction;
+	room: number;
+}
+
+/** Highest room wins; ties keep the earlier option, so side by side beats stacked. */
+function roomiest(options: SplitOption[]): SplitOption | undefined {
+	let best: SplitOption | undefined;
+	for (const option of options) if (!best || option.room > best.room) best = option;
+	return best;
 }
 
 /**
- * Geometry-aware placement. Candidates, first fit wins: the source pane side by side, the
- * largest other pane side by side, the source stacked, the largest other pane stacked. An
- * explicit direction restricts the search to that axis. Without a fit, automatic placement
- * opens a tab and a forced split divides the source pane anyway.
+ * Geometry-aware placement. The fork stays in the source pane whenever either axis fits, and
+ * that pane splits along whichever axis leaves the roomier halves. Only a source too small for
+ * any split hands the fork to another pane: the best-scoring fit, largest pane on ties. An
+ * explicit direction restricts every search to that direction. Without a fit, automatic
+ * placement opens a tab and a forced split divides the source along its roomier axis anyway.
  */
 function planPlacement(
 	request: Pick<SideRequest, "placement" | "direction">,
@@ -513,19 +534,28 @@ function planPlacement(
 	limits: PlacementLimits,
 ): PlacementPlan {
 	if (request.placement === "tab") return { placement: "tab" };
-	const source = panes.find((pane) => pane.id === sourceId);
-	const largestFirst = panes
-		.filter((pane) => pane.id !== sourceId)
-		.sort((a, b) => b.cols * b.rows - a.cols * a.rows);
-	const candidates = source ? [source, ...largestFirst] : largestFirst;
 	const directions: Direction[] = request.direction ? [request.direction] : ["right", "down"];
-	for (const direction of directions) {
-		const horizontal = direction === "left" || direction === "right";
-		const pane = candidates.find((candidate) => splitFits(candidate, horizontal, limits));
-		if (pane) return { placement: "split", pane: pane.id, direction };
-	}
+	const options = (pane: PaneGeometry): SplitOption[] =>
+		directions.map((direction) => ({
+			pane: pane.id,
+			direction,
+			room: splitRoom(pane, direction === "left" || direction === "right", limits),
+		}));
+	const source = panes.find((pane) => pane.id === sourceId);
+	const sourceBest = source ? roomiest(options(source)) : undefined;
+	const chosen =
+		sourceBest && sourceBest.room >= 1
+			? sourceBest
+			: roomiest(
+					panes
+						.filter((pane) => pane.id !== sourceId)
+						.sort((a, b) => b.cols * b.rows - a.cols * a.rows)
+						.flatMap(options)
+						.filter((option) => option.room >= 1),
+				);
+	if (chosen) return { placement: "split", pane: chosen.pane, direction: chosen.direction };
 	if (request.placement === "split") {
-		return { placement: "split", pane: sourceId, direction: request.direction ?? "right" };
+		return { placement: "split", pane: sourceId, direction: sourceBest?.direction ?? directions[0] };
 	}
 	return { placement: "tab" };
 }

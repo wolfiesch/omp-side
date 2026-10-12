@@ -70,7 +70,7 @@ Use one method or the other. Both at once registers the command twice.
 |---|---|
 | `--bg` | Do not steal focus. |
 | `--tab` | Force a new terminal tab. In tmux this is a new window. |
-| `--split` | Split even when no pane meets the minimum size; without a fit, your pane splits to the right. |
+| `--split` | Split even when no pane meets the minimum size; without a fit, your pane splits along its roomier axis. |
 | `--left` `--right` `--up` `--down` | Split in that direction only. The same size search runs on that axis; without a fit, your pane splits anyway. |
 | `--pull` | Watch the fork and attach its first answer to your next message here. |
 | anything else | Passed through to `omp`, so `--model`, `--thinking`, `--tools`, and friends all work. |
@@ -88,13 +88,17 @@ is accepted, so the whole launch can be built without memorizing flag values.
 ### Automatic placement
 
 In tmux, Tern, and WezTerm, `/side` reads each pane's size and splits only where both halves stay at
-least 80 columns wide and 30 rows tall. It tries, in order:
+least 80 columns wide and 30 rows tall.
 
-1. your pane, side by side;
-2. the largest other pane in the tab, side by side;
-3. your pane, top and bottom;
-4. the largest other pane, top and bottom;
-5. a new tab.
+1. **Your pane first.** When your pane can split either way, the fork opens next to you. The split
+   goes along whichever axis leaves the roomier halves, measured against the minimum size, so a wide
+   pane goes side by side and a tall pane stacks. Ties go side by side.
+2. **Another pane only when yours is too small.** The fork goes to whichever pane and axis has the
+   most room left over, preferring the largest pane on ties.
+3. **A new tab** when nothing fits.
+
+An explicit direction keeps the same order but searches only that direction. `--split` without a
+fit divides your pane along its roomier axis.
 
 Existing panes are never resized. Tern picture-in-picture panes float over the layout, so they are
 neither split nor counted. Set `OMP_SIDE_MIN_COLS` and `OMP_SIDE_MIN_ROWS` to change the minimum;
