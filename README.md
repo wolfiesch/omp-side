@@ -39,7 +39,7 @@ the child does can affect the main conversation unless you ask for its first ans
 ## Install
 
 ```sh
-omp plugin install github:wolfiesch/omp-side
+omp plugin install omp-side
 ```
 
 Restart omp. Extensions load at startup, so the session you are in when you install will not have `/side` yet.
