@@ -106,6 +106,19 @@ describe("argument completion", () => {
 	test("does not suggest options inside the prompt", () => {
 		expect(__testing.getSideArgumentCompletions("--model @smol -- explain this", models)).toBeNull();
 		expect(__testing.getSideArgumentCompletions("explain", models)).toBeNull();
+		expect(__testing.getSideArgumentCompletions("explain this ", models)).toBeNull();
+		expect(__testing.getSideArgumentCompletions("--bg explain this ", models)).toBeNull();
+		expect(__testing.getSideArgumentCompletions("--model @smol explain ", models)).toBeNull();
+	});
+
+	test("opens the menu after a bare /side and keeps it through leading options", () => {
+		expect(__testing.getSideArgumentCompletions("", models)?.map(item => item.value)).toContain("list ");
+		expect(__testing.getSideArgumentCompletions("--bg ", models)?.map(item => item.value)).toContain(
+			"--bg --pull ",
+		);
+		expect(__testing.getSideArgumentCompletions("--model @smol ", models)?.map(item => item.value)).toContain(
+			"--model @smol --bg ",
+		);
 	});
 });
 

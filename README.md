@@ -88,7 +88,9 @@ For a prompt starting with a reserved word, write `/side -- list the possible ca
 Typing `/side ` opens argument completion. Continue with `--m` to choose from authenticated models or
 role aliases such as `@smol` and `@slow`; `--thinking` offers the supported CLI reasoning levels.
 Choose `--` when you are ready to type the prompt. Earlier options remain intact as each completion
-is accepted, so the whole launch can be built without memorizing flag values.
+is accepted, so the whole launch can be built without memorizing flag values. Completion stays
+out of the way while you write a prompt: `/side fix the bug` never opens the menu, because a
+prompt that does not start with `-` takes no options.
 
 ### Managing forks
 
