@@ -100,6 +100,9 @@ const THINKING_LEVEL_COMPLETIONS: readonly CompletionItem[] = [
 	{ value: "auto", label: "auto", description: "Let OMP choose for the model" },
 ];
 
+/** Flags whose next token is their value rather than the start of the prompt. */
+const VALUE_FLAGS: readonly string[] = ["--model", "--thinking"];
+
 function completeValues(
 	head: string,
 	query: string,
@@ -125,12 +128,19 @@ function getSideArgumentCompletions(
 	const query = tokenMatch[2] ?? "";
 	const priorTokens = head.trim().split(/\s+/).filter(Boolean);
 	const previous = priorTokens.at(-1);
-	if (["list", "focus", "close"].includes(priorTokens[0])) return null;
-	if (priorTokens.length === 0 && (!query || !query.startsWith("-"))) {
+	if (priorTokens.length === 0) {
+		if (query.startsWith("-")) return completeValues(head, query, SIDE_FLAG_COMPLETIONS);
 		const commands = completeValues(head, query, SIDE_COMMAND_COMPLETIONS);
 		if (query) return commands;
 		return [...(commands ?? []), ...(completeValues(head, query, SIDE_FLAG_COMPLETIONS) ?? [])];
 	}
+	// parseRequest reads options only when the arguments open with `-`, so a bare first word
+	// starts the prompt (or a management command), and a bare word after a non-value flag ends
+	// the option region. Suggesting flags there would pop up after every space in the prompt.
+	const endsOptions = priorTokens.some(
+		(token, index) => !token.startsWith("-") && !VALUE_FLAGS.includes(priorTokens[index - 1] ?? ""),
+	);
+	if (endsOptions) return null;
 
 	if (previous === "--model") {
 		const normalized = query.toLowerCase();
