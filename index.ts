@@ -12,10 +12,11 @@
  * before launch so a completion reminder cannot drag the tangent back into the parent's work.
  */
 
-import { accessSync, constants, existsSync, readdirSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { open, readdir, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { basename, delimiter, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
 	checked, collectForks, detectTerminal, manageForks, parseManagementCommand,
@@ -708,6 +709,64 @@ async function launchCmux(
 	return { target, terminal: "cmux", placement };
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object";
+}
+
+async function launchHerdr(
+	run: Runner,
+	env: NodeJS.ProcessEnv,
+	request: SideRequest,
+	cwd: string,
+	argv: string[],
+	title: string,
+): Promise<LaunchResult> {
+	const source = env.HERDR_PANE_ID;
+	if (!source || !env.HERDR_SOCKET_PATH) throw new Error("Herdr pane or socket identity is missing");
+	const response: unknown = JSON.parse(await checked(run, "herdr", ["pane", "layout", "--pane", source]));
+	const result = isObject(response) && isObject(response.result) ? response.result : undefined;
+	const layout = result && isObject(result.layout) ? result.layout : undefined;
+	if (!layout || typeof layout.workspace_id !== "string" || !Array.isArray(layout.panes)) {
+		throw new Error("unexpected herdr pane layout");
+	}
+	const panes: PaneGeometry[] = layout.panes.map((pane: unknown) => {
+		if (!isObject(pane) || typeof pane.pane_id !== "string" || !isObject(pane.rect) ||
+			typeof pane.rect.width !== "number" || typeof pane.rect.height !== "number" ||
+			typeof pane.rect.x !== "number" || typeof pane.rect.y !== "number") {
+			throw new Error("unexpected herdr pane geometry");
+		}
+		return { id: pane.pane_id, cols: pane.rect.width, rows: pane.rect.height, left: pane.rect.x, top: pane.rect.y };
+	});
+	if (!panes.some(pane => pane.id === source)) throw new Error(`Herdr pane ${source} is not in its layout`);
+	const plan = planPlacement(request, source, panes, placementLimits(env), DEFAULT_CELL_ASPECT, request.sidePanes);
+	const focus = request.focus ? "--focus" : "--no-focus";
+	const created: unknown = plan.placement === "tab"
+		? JSON.parse(await checked(run, "herdr", ["tab", "create", "--workspace", layout.workspace_id, "--cwd", cwd, "--label", title, "--env", "OMPCODE=", focus]))
+		: JSON.parse(await checked(run, "herdr", [
+			"pane", "split", plan.pane, "--direction",
+			plan.direction === "left" || plan.direction === "right" ? "right" : "down",
+			"--cwd", cwd, "--env", "OMPCODE=", focus,
+		]));
+	const createdResult = isObject(created) && isObject(created.result) ? created.result : undefined;
+	const pane = createdResult && (plan.placement === "tab" ? createdResult.root_pane : createdResult.pane);
+	const target = isObject(pane) ? pane.pane_id : undefined;
+	if (typeof target !== "string" || !target) throw new Error("unexpected herdr create response");
+	if (plan.placement === "split" && (plan.direction === "left" || plan.direction === "up")) {
+		await checked(run, "herdr", ["pane", "swap", "--source-pane", plan.pane, "--target-pane", target]);
+	}
+	// Herdr sends through a canonical-mode terminal; long paths or prompts can exceed its line limit.
+	const dir = mkdtempSync(join(tmpdir(), "omp-side-"));
+	const script = join(dir, "start");
+	try {
+		writeFileSync(script, `#!/bin/sh\nrm -f -- "$0"\nrmdir -- ${shQuote(dir)}\nexec ${argv.map(shQuote).join(" ")}\n`, { mode: 0o700 });
+		await checked(run, "herdr", ["pane", "run", target, shQuote(script)]);
+	} catch (error) {
+		rmSync(dir, { recursive: true, force: true });
+		throw error;
+	}
+	return { target, terminal: "herdr", placement: plan.placement };
+}
+
 async function launchTmux(
 	run: Runner,
 	env: NodeJS.ProcessEnv,
@@ -989,6 +1048,8 @@ async function launchInTerminal(
 ): Promise<LaunchResult> {
 	const command = commandWithRuntimePath(argv, env.PATH, process.execPath);
 	switch (detectTerminal(env)) {
+		case "herdr":
+			return launchHerdr(run, env, request, cwd, command, title);
 		case "cmux":
 			return launchCmux(run, env, request, cwd, command, title);
 		case "tmux":
@@ -1003,7 +1064,7 @@ async function launchInTerminal(
 			return launchGhostty(run, platform, cwd, command);
 		default:
 			throw new Error(
-				"unsupported terminal: use cmux, tmux, Tern, WezTerm, Kitty, or Ghostty (direct Ghostty opens a new window)",
+				"unsupported terminal: use Herdr, cmux, tmux, Tern, WezTerm, Kitty, or Ghostty (direct Ghostty opens a new window)",
 			);
 	}
 }

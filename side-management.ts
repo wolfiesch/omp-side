@@ -19,7 +19,7 @@ import { basename, delimiter, join } from "node:path";
 export const SPAWN_ENTRY_TYPE = "omp-side.spawn";
 export const CLOSED_ENTRY_TYPE = "omp-side.closed";
 
-export type TerminalKind = "cmux" | "tmux" | "tern" | "wezterm" | "kitty" | "ghostty";
+export type TerminalKind = "herdr" | "cmux" | "tmux" | "tern" | "wezterm" | "kitty" | "ghostty";
 
 export interface ExecOutput {
 	code: number;
@@ -69,7 +69,7 @@ export interface ManageOptions {
 	recordClose: (spawnEntryId: string) => void;
 }
 
-const TERMINALS: readonly string[] = ["cmux", "tmux", "tern", "wezterm", "kitty", "ghostty"];
+const TERMINALS: readonly string[] = ["herdr", "cmux", "tmux", "tern", "wezterm", "kitty", "ghostty"];
 const PLACEMENTS: readonly string[] = ["split", "tab", "window"];
 const TERN_APP_BINARY = "/Applications/Tern.app/Contents/MacOS/tern";
 
@@ -156,6 +156,7 @@ export function collectForks(entries: readonly unknown[], parentSessionFile: str
 }
 
 export function detectTerminal(env: NodeJS.ProcessEnv): TerminalKind | null {
+	if (env.HERDR_ENV === "1") return "herdr";
 	if (env.CMUX_WORKSPACE_ID) return "cmux";
 	if (env.TMUX) return "tmux";
 	if (env.TERM_PROGRAM?.toLowerCase() === "tern" && env.TERN_PANE) return "tern";
@@ -173,6 +174,9 @@ export function detectTerminal(env: NodeJS.ProcessEnv): TerminalKind | null {
 export function terminalScope(terminal: TerminalKind, env: NodeJS.ProcessEnv): string {
 	let parts: (string | undefined)[];
 	switch (terminal) {
+		case "herdr":
+			parts = [env.HERDR_SOCKET_PATH];
+			break;
 		case "tmux":
 			// TMUX is "socket-path,server-pid,session-index": the session index changes per client.
 			parts = (env.TMUX ?? "").split(",").slice(0, 2);
@@ -211,10 +215,11 @@ interface Context {
 
 /** What one backend inventory says about a pane that exists. */
 interface PaneFacts {
-	/** Whether the pane's process data names the child session; null when the backend cannot say. */
+	/** Whether the pane identifies the child session; null when the backend cannot say. */
 	runsChild: boolean | null;
 	/** Whether this is the pane the current session runs in. */
 	current: boolean;
+	reason?: string;
 }
 
 /** Looks one pane up in an inventory read once; null means the pane is not there. */
@@ -334,6 +339,40 @@ function numericId(value: unknown): number | null {
 function envNumber(raw: string | undefined): number | null {
 	return raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : null;
 }
+
+const herdrBackend: Backend = {
+	// Pane IDs are opaque; only exclude values the CLI could parse as options or not pass as argv.
+	target: (raw) => (raw && !raw.startsWith("-") && !/\s/.test(raw) && !raw.includes("\0") ? raw : null),
+	async snapshot(ctx) {
+		const response = await checkedJson(ctx.run, "herdr", ["api", "snapshot"]);
+		const result = isRecord(response) && isRecord(response.result) ? response.result : null;
+		const snapshot = result && isRecord(result.snapshot) ? result.snapshot : null;
+		if (!snapshot || !Array.isArray(snapshot.panes)) throw new Error("herdr api snapshot: unexpected response");
+		const panes = new Map<string, Record<string, unknown>>();
+		for (const pane of snapshot.panes) {
+			if (!isRecord(pane) || typeof pane.pane_id !== "string" || panes.has(pane.pane_id)) {
+				throw new Error("herdr api snapshot: unexpected pane");
+			}
+			panes.set(pane.pane_id, pane);
+		}
+		const currentResponse = await checkedJson(ctx.run, "herdr", ["pane", "current", "--current"]);
+		const currentResult = isRecord(currentResponse) && isRecord(currentResponse.result) ? currentResponse.result : null;
+		const current = currentResult && isRecord(currentResult.pane) ? currentResult.pane.pane_id : null;
+		if (typeof current !== "string" || !panes.has(current)) throw new Error("herdr pane current: unexpected response");
+		return async (target, child) => {
+			const pane = panes.get(target);
+			if (!pane) return null;
+			const session = isRecord(pane.agent_session) ? pane.agent_session : null;
+			return {
+				runsChild: pane.agent === "omp" && session?.agent === "omp" && session.kind === "path" && session.value === child,
+				current: target === current || target === ctx.env.HERDR_PANE_ID,
+				reason: session ? "the pane no longer runs this fork session" : "Herdr has not reported this pane's OMP session",
+			};
+		};
+	},
+	focus: (_ctx, target) => [["herdr", ["agent", "focus", target]]],
+	close: (_ctx, target) => [["herdr", ["pane", "close", target]]],
+};
 
 const tmuxBackend: Backend = {
 	target: (raw) => (/^%\d+$/.test(raw.trim()) ? raw.trim() : null),
@@ -487,6 +526,7 @@ const cmuxBackend: Backend = {
 };
 
 const BACKENDS: Record<Exclude<TerminalKind, "ghostty">, Backend> = {
+	herdr: herdrBackend,
 	tmux: tmuxBackend,
 	tern: ternBackend,
 	wezterm: weztermBackend,
@@ -500,6 +540,8 @@ const BACKENDS: Record<Exclude<TerminalKind, "ghostty">, Backend> = {
  */
 export function terminalSource(terminal: TerminalKind, env: NodeJS.ProcessEnv): string | undefined {
 	switch (terminal) {
+		case "herdr":
+			return herdrBackend.target(env.HERDR_PANE_ID ?? "") ?? undefined;
 		case "tmux":
 			return tmuxBackend.target(env.TMUX_PANE ?? "") ?? undefined;
 		case "tern":
@@ -546,12 +588,18 @@ async function assess(fork: ManagedFork, ctx: Context, snapshotFor: SnapshotFor)
 	if (current !== data.terminal) {
 		return { state: "unavailable", reason: `launched from ${data.terminal}, which is not this terminal` };
 	}
+	if (current === "herdr" && (!ctx.env.HERDR_SOCKET_PATH || !terminalSource("herdr", ctx.env))) {
+		return { state: "unavailable", reason: "Herdr socket or current pane is missing" };
+	}
 	if (terminalScope(current, ctx.env) !== data.scope) {
 		return { state: "unavailable", reason: `belongs to a different ${data.terminal} server or window` };
 	}
 	const backend = BACKENDS[data.terminal];
 	const target = backend.target(data.target);
 	if (!target) return { state: "unverified", reason: "target was not recorded in a manageable form" };
+	if (current === "herdr" && (!data.source || !backend.target(data.source))) {
+		return { state: "unverified", reason: "Herdr parent pane was not recorded" };
+	}
 	if (data.source !== undefined && (data.source.trim() === data.target.trim() || backend.target(data.source) === target)) {
 		return { state: "unavailable", reason: "target is the parent pane" };
 	}
@@ -559,7 +607,7 @@ async function assess(fork: ManagedFork, ctx: Context, snapshotFor: SnapshotFor)
 	if (!facts) return { state: "gone", reason: "the pane no longer exists" };
 	if (facts.current) return { state: "unavailable", reason: "target is the pane running this session" };
 	if (facts.runsChild === false) {
-		return { state: "unverified", reason: "the pane no longer runs this fork session" };
+		return { state: "unverified", reason: facts.reason ?? "the pane no longer runs this fork session" };
 	}
 	return { state: "live", backend, target };
 }
@@ -621,7 +669,17 @@ async function requireLive(
 }
 
 async function runAll(ctx: Context, invocations: [string, string[]][]): Promise<void> {
-	for (const [command, args] of invocations) await checked(ctx.run, command, args);
+	for (const [command, args] of invocations) {
+		if (command !== "herdr") {
+			await checked(ctx.run, command, args);
+			continue;
+		}
+		const response = await checkedJson(ctx.run, command, args);
+		const result = isRecord(response) && isRecord(response.result) ? response.result : null;
+		if (!isRecord(response) || "error" in response || !result || typeof result.type !== "string") {
+			throw new Error(`herdr ${args[0]} ${args[1]}: unexpected response`);
+		}
+	}
 }
 
 export async function manageForks(

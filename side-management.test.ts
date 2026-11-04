@@ -3,6 +3,7 @@ import {
 	CLOSED_ENTRY_TYPE,
 	SPAWN_ENTRY_TYPE,
 	collectForks,
+	detectTerminal,
 	manageForks,
 	parseManagementCommand,
 	terminalScope,
@@ -148,6 +149,8 @@ function isInventoryRead(args: string[]): boolean {
 		["list-panes", "inspect"].includes(args[0]) ||
 		(args[0] === "cli" && args[1] === "list") ||
 		(args[0] === "@" && args[1] === "ls") ||
+		(args[0] === "api" && args[1] === "snapshot") ||
+		(args[0] === "pane" && args[1] === "current") ||
 		args.includes("tree")
 	);
 }
@@ -518,5 +521,154 @@ describe("manageForks per terminal", () => {
 		const focus = harness(env, respond);
 		await manageForks({ action: "focus", number: 1 }, [fork(env, "cmux", { target: "surface:12" })], focus.options);
 		expect(focus.mutations()).toEqual(["cmux focus-panel --panel surface:12 --workspace workspace:1"]);
+	});
+});
+
+describe("Herdr management", () => {
+	const env = {
+		HERDR_ENV: "1",
+		HERDR_SOCKET_PATH: "/tmp/herdr.sock",
+		HERDR_PANE_ID: "w1:p1",
+		TMUX: "/tmp/tmux,1,0",
+		TERM_PROGRAM: "ghostty",
+		PATH: "",
+	};
+	const pane = (paneId: string, sessionFile = CHILD) => ({
+		pane_id: paneId,
+		agent: "omp",
+		agent_session: { agent: "omp", kind: "path", value: sessionFile },
+	});
+	const parent = { pane_id: "w1:p1" };
+	const child = pane("w1:p2");
+	const candidate = () => fork(env, "herdr", { target: "w1:p2", source: "w1:p1" });
+	const snapshot = (panes: unknown[]) => JSON.stringify({ result: { type: "session_snapshot", snapshot: { panes } } });
+	const respond = (panes: unknown[] = [parent, child], currentId = "w1:p1") => (_command: string, args: string[]): Reply => {
+		if (args[0] === "api") return { stdout: snapshot(panes) };
+		if (args[0] === "pane" && args[1] === "current") {
+			return { stdout: JSON.stringify({ result: { type: "pane_info", pane: { pane_id: currentId } } }) };
+		}
+		return { stdout: JSON.stringify({ result: { type: "ok" } }) };
+	};
+
+	test("detects Herdr ahead of inherited terminals and uses its socket and opaque pane ID", () => {
+		expect(detectTerminal(env)).toBe("herdr");
+		expect(detectTerminal({ ...env, HERDR_ENV: "0" })).toBe("tmux");
+		expect(terminalScope("herdr", env)).not.toContain(env.HERDR_SOCKET_PATH);
+		expect(terminalScope("herdr", env)).not.toBe(terminalScope("herdr", { ...env, HERDR_SOCKET_PATH: "/other.sock" }));
+		expect(terminalSource("herdr", env)).toBe("w1:p1");
+		expect(terminalSource("herdr", { HERDR_PANE_ID: "opaque-pane" })).toBe("opaque-pane");
+		expect(terminalSource("herdr", { HERDR_PANE_ID: "--current" })).toBeUndefined();
+		expect(terminalSource("herdr", { HERDR_PANE_ID: "w1:p1\n" })).toBeUndefined();
+	});
+
+	test("collects Herdr spawn records and lists matching, missing, and unrelated sessions", async () => {
+		const entries = [
+			spawnEntry("herdr", { ...candidate().data }),
+			spawnEntry("missing", { ...candidate().data, target: "w1:p9" }),
+			spawnEntry("other", { ...candidate().data, target: "w1:p3" }),
+		];
+		const forks = collectForks(entries, PARENT);
+		const h = harness(env, respond([parent, child, pane("w1:p3", "/sessions/other.jsonl")]));
+		await manageForks({ action: "list" }, forks, h.options);
+		expect(h.notes[0].message).toMatch(/1\. live\s+herdr/);
+		expect(h.notes[0].message).toMatch(/2\. gone\s+herdr/);
+		expect(h.notes[0].message).toMatch(/3\. unverified\s+herdr/);
+		expect(h.mutations()).toEqual([]);
+		expect(h.calls.map(({ args }) => args)).toEqual([["api", "snapshot"], ["pane", "current", "--current"]]);
+	});
+
+	test("focuses the exact recorded pane using independent arguments", async () => {
+		const h = harness(env, respond());
+		await manageForks({ action: "focus", number: 1 }, [candidate()], h.options);
+		expect(h.calls.at(-1)).toEqual({ command: "herdr", args: ["agent", "focus", "w1:p2"] });
+		expect(h.notes.at(-1)?.level).toBe("info");
+	});
+
+	test("passes a matching opaque ID as a single argument, never shell syntax", async () => {
+		const target = "pane;touch-file";
+		const h = harness(env, respond([parent, pane(target)]));
+		const record = fork(env, "herdr", { target, source: "w1:p1" });
+		await manageForks({ action: "focus", number: 1 }, [record], h.options);
+		expect(h.calls.at(-1)).toEqual({ command: "herdr", args: ["agent", "focus", target] });
+	});
+
+	test("explains missing session metadata without calling the pane gone", async () => {
+		const h = harness(env, respond([parent, { pane_id: "w1:p2", agent: "omp" }]));
+		await manageForks({ action: "list" }, [candidate()], h.options);
+		expect(h.notes[0].message).toMatch(/unverified.*Herdr has not reported this pane's OMP session/);
+		expect(h.notes[0].message).not.toMatch(/gone/);
+	});
+
+	test("confirms, rechecks and closes only the recorded pane", async () => {
+		const h = harness(env, respond());
+		await manageForks({ action: "close", number: 1 }, [candidate()], h.options);
+		expect(h.confirms).toHaveLength(1);
+		expect(h.calls.map(({ args }) => args)).toEqual([
+			["api", "snapshot"], ["pane", "current", "--current"],
+			["api", "snapshot"], ["pane", "current", "--current"],
+			["pane", "close", "w1:p2"],
+		]);
+		expect(h.closed).toEqual(["spawn-1"]);
+	});
+
+	test("refuses an absent, different, or stale OMP session and invalid scope or source", async () => {
+		const cases: [ManagedFork, NodeJS.ProcessEnv, unknown[]][] = [
+			[candidate(), env, [parent, { pane_id: "w1:p2", agent: "omp" }]],
+			[candidate(), env, [parent, pane("w1:p2", `${CHILD}.backup`)]],
+			[candidate(), env, [parent, { ...child, agent: "codex" }]],
+			[candidate(), env, [parent, { ...child, agent_session: { ...child.agent_session, agent: "codex" } }]],
+			[candidate(), env, [parent, { ...child, agent_session: { ...child.agent_session, kind: "id" } }]],
+			[fork(env, "herdr", { target: "w1:p2", source: undefined }), env, [parent, child]],
+			[fork(env, "herdr", { target: "w1:p1", source: "w1:p1" }), env, [parent, child]],
+			[fork(env, "herdr", { target: "--current", source: "w1:p1" }), env, [parent, child]],
+			[candidate(), { ...env, HERDR_SOCKET_PATH: "/other.sock" }, [parent, child]],
+			[candidate(), { ...env, HERDR_SOCKET_PATH: "" }, [parent, child]],
+			[candidate(), { ...env, HERDR_PANE_ID: "" }, [parent, child]],
+		];
+		for (const [record, context, panes] of cases) {
+			const h = harness(context, respond(panes));
+			await manageForks({ action: "close", number: 1 }, [record], h.options);
+			expect(h.mutations()).toEqual([]);
+			expect(h.confirms).toEqual([]);
+			expect(h.closed).toEqual([]);
+			expect(h.notes.at(-1)?.level).toBe("error");
+		}
+	});
+
+	test("resolves the current pane after it moves and never closes it", async () => {
+		const moved = fork(env, "herdr", { target: "w2:p1", source: "w1:p1" });
+		const h = harness(env, respond([parent, pane("w2:p1")], "w2:p1"));
+		await manageForks({ action: "close", number: 1 }, [moved], h.options);
+		expect(h.mutations()).toEqual([]);
+		expect(h.confirms).toEqual([]);
+		expect(h.closed).toEqual([]);
+	});
+
+	test("a fork that switches sessions during confirmation is not closed", async () => {
+		let reads = 0;
+		const h = harness(env, (command, args) => {
+			if (args[0] === "api") {
+				reads += 1;
+				return { stdout: snapshot([parent, reads === 1 ? child : pane("w1:p2", "/sessions/other.jsonl")]) };
+			}
+			return respond()(command, args);
+		});
+		await manageForks({ action: "close", number: 1 }, [candidate()], h.options);
+		expect(h.confirms).toHaveLength(1);
+		expect(h.mutations()).toEqual([]);
+		expect(h.closed).toEqual([]);
+		expect(h.notes.at(-1)?.message).toMatch(/no longer runs this fork/);
+	});
+
+	test("malformed JSON or action responses never record a successful close", async () => {
+		const badSnapshot = harness(env, () => ({ stdout: "{}" }));
+		await manageForks({ action: "list" }, [candidate()], badSnapshot.options);
+		expect(badSnapshot.notes[0].level).toBe("warning");
+		expect(badSnapshot.notes[0].message).toMatch(/unavailable/);
+		const badClose = harness(env, (command, args) =>
+			args[0] === "pane" && args[1] === "close" ? { stdout: "{}" } : respond()(command, args),
+		);
+		await expect(manageForks({ action: "close", number: 1 }, [candidate()], badClose.options)).rejects.toThrow(/unexpected response/);
+		expect(badClose.closed).toEqual([]);
 	});
 });
