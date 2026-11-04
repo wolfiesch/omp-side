@@ -577,6 +577,16 @@ describe("Herdr management", () => {
 		expect(h.calls.map(({ args }) => args)).toEqual([["api", "snapshot"], ["pane", "current", "--current"]]);
 	});
 
+	test("refuses a recorded pane ID containing terminal control characters", async () => {
+		const target = "w1:p2\u001b[31m";
+		const h = harness(env, respond([parent, pane(target)]));
+		const record = fork(env, "herdr", { target, source: "w1:p1" });
+		await manageForks({ action: "focus", number: 1 }, [record], h.options);
+		expect(h.mutations()).toEqual([]);
+		expect(h.notes.at(-1)?.level).toBe("error");
+		expect(h.notes.every(note => !note.message.includes("\u001b"))).toBe(true);
+	});
+
 	test("focuses the exact recorded pane using independent arguments", async () => {
 		const h = harness(env, respond());
 		await manageForks({ action: "focus", number: 1 }, [candidate()], h.options);

@@ -721,7 +721,7 @@ async function launchHerdr(
 	argv: string[],
 	title: string,
 ): Promise<LaunchResult> {
-	const source = env.HERDR_PANE_ID;
+	let source = env.HERDR_PANE_ID;
 	if (!source || !env.HERDR_SOCKET_PATH) throw new Error("Herdr pane or socket identity is missing");
 	const response: unknown = JSON.parse(await checked(run, "herdr", ["pane", "layout", "--pane", source]));
 	const result = isObject(response) && isObject(response.result) ? response.result : undefined;
@@ -737,7 +737,15 @@ async function launchHerdr(
 		}
 		return { id: pane.pane_id, cols: pane.rect.width, rows: pane.rect.height, left: pane.rect.x, top: pane.rect.y };
 	});
-	if (!panes.some(pane => pane.id === source)) throw new Error(`Herdr pane ${source} is not in its layout`);
+	if (!panes.some(pane => pane.id === source)) {
+		const current: unknown = JSON.parse(await checked(run, "herdr", ["pane", "current", "--current"]));
+		const currentResult = isObject(current) && isObject(current.result) ? current.result : undefined;
+		const currentPane = currentResult && isObject(currentResult.pane) ? currentResult.pane : undefined;
+		if (!currentPane || typeof currentPane.pane_id !== "string" || !panes.some(pane => pane.id === currentPane.pane_id)) {
+			throw new Error("Herdr current pane is not in its layout");
+		}
+		source = currentPane.pane_id;
+	}
 	const plan = planPlacement(request, source, panes, placementLimits(env), DEFAULT_CELL_ASPECT, request.sidePanes);
 	const focus = request.focus ? "--focus" : "--no-focus";
 	const created: unknown = plan.placement === "tab"

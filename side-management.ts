@@ -342,7 +342,7 @@ function envNumber(raw: string | undefined): number | null {
 
 const herdrBackend: Backend = {
 	// Pane IDs are opaque; only exclude values the CLI could parse as options or not pass as argv.
-	target: (raw) => (raw && !raw.startsWith("-") && !/\s/.test(raw) && !raw.includes("\0") ? raw : null),
+	target: (raw) => (raw && !raw.startsWith("-") && !/[\s\u0000-\u001f\u007f-\u009f]/.test(raw) ? raw : null),
 	async snapshot(ctx) {
 		const response = await checkedJson(ctx.run, "herdr", ["api", "snapshot"]);
 		const result = isRecord(response) && isRecord(response.result) ? response.result : null;

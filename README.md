@@ -169,6 +169,7 @@ Everything stays local. The watcher reads a file on disk and nothing else.
 
 Herdr is detected before inherited terminal environments. Left and up splits swap the two new
 pane positions because Herdr's split command creates panes to the right or below.
+After moving the current Herdr pane to another workspace, `/side` resolves its new pane ID before launching.
 cmux embeds Ghostty but is detected first, so an OMP process inside cmux gets cmux panes and tabs.
 tmux is detected before Tern, so tmux running inside a Tern pane gets tmux panes and windows.
 Tern opens forks without moving focus and then focuses the fork unless `--bg` is set. Left and up

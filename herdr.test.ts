@@ -66,6 +66,29 @@ describe("Herdr launch", () => {
 		expect(positions.get(result.target)![axis]).toBeLessThan(positions.get("w1:p1")![axis]);
 	});
 
+	test("opens a fork after the calling pane moves to another workspace", async () => {
+		const calls: string[][] = [];
+		const run = async (_command: string, args: string[]) => {
+			calls.push(args);
+			let result: object = {};
+			if (args[1] === "layout") {
+				result = { layout: { workspace_id: "w2", panes: [
+					{ pane_id: "w2:p1", rect: { width: 240, height: 80, x: 0, y: 0 } },
+				] } };
+			} else if (args[1] === "current") {
+				result = { pane: { pane_id: "w2:p1" } };
+			} else if (args[1] === "split") {
+				result = { pane: { pane_id: "w2:p2" } };
+			} else if (args[1] === "run") {
+				rmSync(dirname(args[3].slice(1, -1)), { recursive: true });
+			}
+			return { code: 0, stdout: JSON.stringify({ result }), stderr: "" };
+		};
+		const result = await __testing.launchInTerminal(run, env, "darwin", request, "/tmp", ["omp"], "side");
+		expect(result).toEqual({ terminal: "herdr", target: "w2:p2", placement: "split" });
+		expect(calls.find(args => args[1] === "split")?.[2]).toBe("w2:p1");
+	});
+
 	test("opens a tab when no pane fits", async () => {
 		const calls: string[][] = [];
 		const run = async (_command: string, args: string[]) => {
