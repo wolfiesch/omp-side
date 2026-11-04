@@ -1,6 +1,6 @@
 # omp-side
 
-`/side` for [Oh My Pi](https://github.com/can1357/oh-my-pi), with native launch adapters for [cmux](https://cmux.com), tmux, [Tern](https://stencil.so/tern), WezTerm, Kitty, and Ghostty.
+`/side` for [Oh My Pi](https://github.com/can1357/oh-my-pi), with native launch adapters for [Herdr](https://herdr.dev), [cmux](https://cmux.com), tmux, [Tern](https://stencil.so/tern), WezTerm, Kitty, and Ghostty.
 
 Fork the conversation you are in right now, at this exact point, and open the fork nearby. Ask the tangent there. Your main thread stays clean.
 
@@ -28,6 +28,7 @@ the child does can affect the main conversation unless you ask for its first ans
 
 - `omp` (Oh My Pi) with session persistence on, so not `--no-session`
 - One supported terminal environment:
+  - Herdr, with the `herdr` CLI on `PATH` and a running server
   - cmux
   - tmux
   - Tern, with the `tern` CLI on `PATH` or Tern.app in `/Applications`
@@ -102,7 +103,8 @@ Use `/side focus N` to switch to a live fork. Use `/side close N` to close its p
 confirmation. Closing terminates any running process in that pane; the transcript remains on
 disk. Terminal identity and live pane state are checked again after confirmation.
 
-Management is available in tmux, Tern, WezTerm, Kitty, and cmux. In tmux, Tern, and Kitty, the
+Management is available in Herdr, tmux, Tern, WezTerm, Kitty, and cmux. In Herdr, the pane's
+reported OMP session must match the recorded child session. In tmux, Tern, and Kitty, the
 launch or process arguments must still name the recorded child session. WezTerm and cmux do not
 expose that check through these adapters, so validation uses the terminal scope and exact pane
 identity. Direct Ghostty windows cannot be focused or closed through `/side`.
@@ -113,7 +115,7 @@ case causes a command to target the current pane instead.
 
 ### Automatic placement
 
-In tmux, Tern, and WezTerm, `/side` reads each pane's size and splits only where both halves stay at
+In Herdr, tmux, Tern, and WezTerm, `/side` reads each pane's size and splits only where both halves stay at
 least 80 columns wide and 30 rows tall.
 
 1. **Keep repeat forks together.** If an automatically placed fork from this parent is still
@@ -121,7 +123,7 @@ least 80 columns wide and 30 rows tall.
    unchanged. When no group member has room for another stacked split, use a new tab.
 2. **Otherwise, your pane first.** Split along whichever permitted axis leaves the roomier
    halves on screen. Wide panes go side by side, tall panes stack, and ties go side by side.
-3. **Another pane only when yours is too small.** In tmux, prefer a fitting pane that shares an
+3. **Another pane only when yours is too small.** In Herdr and tmux, prefer a fitting pane that shares an
    edge with yours before considering more distant panes. Within either group, choose the
    roomiest split, preferring the largest pane on ties. Corner-only contact is not adjacency.
 4. **A new tab** when nothing fits.
@@ -135,14 +137,14 @@ search to that direction. `--split` without a fit divides your pane along its be
 
 Screen shape depends on the font: a cell is roughly twice as tall as it is wide, and the exact
 ratio varies by font and size. Tern reports each pane's pixel size, so `/side` uses your actual
-cell shape there. tmux and WezTerm placement assumes a 2:1 cell.
+cell shape there. Herdr, tmux, and WezTerm placement assume a 2:1 cell.
 
 Only the pane selected for a split is divided; unrelated panes are not rearranged. Tern
 picture-in-picture panes are excluded. Set `OMP_SIDE_MIN_COLS` and `OMP_SIDE_MIN_ROWS` to change the minimum;
 a value that is not a positive whole number fails the command with the variable's name.
 
 The cmux and Kitty adapters retain the simpler pane-count rule: a one-pane tab gets one split,
-and an already split tab gets a new tab. Repeat-fork grouping is available in tmux, Tern, and WezTerm.
+and an already split tab gets a new tab. Repeat-fork grouping is available in Herdr, tmux, Tern, and WezTerm.
 
 ## What `--pull` does
 
@@ -157,6 +159,7 @@ Everything stays local. The watcher reads a file on disk and nothing else.
 
 | Environment | Automatic placement | Explicit controls |
 |---|---|---|
+| Herdr | Size-aware split of a pane in the tab; otherwise a new tab | Exact tab and split direction |
 | cmux | Split a one-pane workspace; otherwise a new terminal surface tab in the current pane | Exact tab and split direction |
 | tmux | Size-aware split of any pane in the window; otherwise a new tmux window | Exact window and split direction |
 | Tern | Size-aware split of any tiled pane in the tab; otherwise a new tab in the current session | Exact tab and split direction |
@@ -164,6 +167,9 @@ Everything stays local. The watcher reads a file on disk and nothing else.
 | Kitty | New Kitty window in a one-window tab; otherwise a new tab | Tab or split axis; Kitty's active layout decides final ordering |
 | Ghostty directly | New OS window | Ghostty does not expose stable cross-platform tab or split control |
 
+Herdr is detected before inherited terminal environments. Left and up splits swap the two new
+pane positions because Herdr's split command creates panes to the right or below.
+After moving the current Herdr pane to another workspace, `/side` resolves its new pane ID before launching.
 cmux embeds Ghostty but is detected first, so an OMP process inside cmux gets cmux panes and tabs.
 tmux is detected before Tern, so tmux running inside a Tern pane gets tmux panes and windows.
 Tern opens forks without moving focus and then focuses the fork unless `--bg` is set. Left and up
